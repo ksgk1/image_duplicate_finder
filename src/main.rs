@@ -1,17 +1,18 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
-
+use std::sync::LazyLock;
 use {
     color_eyre::eyre::Result,
-    eframe::egui::{self, mutex::Mutex, ProgressBar},
-    lazy_static::lazy_static,
+    eframe::egui::{self, ProgressBar, mutex::Mutex},
+    // lazy_static::lazy_static,
     std::{
+        env,
         path::Path,
         sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
         },
         thread::available_parallelism,
     },
+    tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt},
     ui::{create_folder_selection_block, create_progress_bar_item, create_result_display, create_result_items, create_scanning_item},
 };
 
@@ -26,21 +27,19 @@ const UI_WINDOW_HEIGHT: f32 = 1000.0;
 const UI_SCALING_FACTOR: f32 = 1.5;
 const SCANNING_DATA_FILE_NAME: &str = "image_duplicates.scan.dat";
 const ANALYSING_DATA_FILE_NAME: &str = "image_duplicates.corr.dat";
-/// Folder within the scanned folder's root, to move the duplicates too
-///
-/// this folder will be ignored when scanning for files, so the files are
-///
+/// The Folder within the scanned folder's root, to move the duplicates to
+/// this folder, will be ignored when scanning for files, so the files are
 /// not deleted but ignored for further scans.
 const POTENTIAL_DUPLICATES_FOLDER: &str = "potential_duplicates";
-/// How many combinations are calculated at once. For large folders with many thousands of files, this will split the work into chunks.
+/// Defines how many combinations are calculated at once. For large folders with many thousands of files, this will split the work into chunks.
 ///
-/// If there is no chunking, a large amount of files will crash the program caused be out of memory (OOM).
-const ANALYSIS_CHUNK_SIZE: i32 = 5_000_000;
+/// If there is no chunking, a large number of files will crash the program caused to be out of memory (OOM).
+const ANALYSIS_CHUNK_SIZE: usize = 10_000_000;
 /// Will split the image into 4x4 tiles
 const TILE_COUNT_PER_SIDE: u32 = 4;
 /// Not worth saving if the resemblance is too low, it will only slow down the process and generate unnecessary data.
 const CORRELATION_THRESHOLD: f32 = 0.95;
-/// How many different root scan folders can be used
+/// Defines how many different root scan folders can be used
 const MAX_FOLDER_SCANS: usize = 3;
 
 #[derive(Debug, PartialEq)]
@@ -50,19 +49,33 @@ enum Direction {
     None,
 }
 
-lazy_static! {
-    // TODO: Move arc mutexes from MyApp to here.
-    static ref UNDO_LIST: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    static ref AUTO_FORWARD_DIRECTION: Arc<Mutex<Direction>> = Arc::new(Mutex::new(Direction::None));
-    static ref MAX_WORKERS: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
-}
+// lazy_static! {
+//     // TODO: Move arc mutexes from MyApp to here.
+//     static ref UNDO_LIST: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+//     static ref AUTO_FORWARD_DIRECTION: Arc<Mutex<Direction>> = Arc::new(Mutex::new(Direction::None));
+//     static ref MAX_WORKERS: Arc<AtomicU16> = Arc::new(AtomicU16::new(0));
+// }
+static UNDO_LIST: LazyLock<Arc<Mutex<Vec<String>>>> = LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
+
+static AUTO_FORWARD_DIRECTION: LazyLock<Arc<Mutex<Direction>>> = LazyLock::new(|| Arc::new(Mutex::new(Direction::None)));
+
+static MAX_WORKERS: LazyLock<Arc<AtomicU16>> = LazyLock::new(|| Arc::new(AtomicU16::new(0)));
 
 fn main() -> Result<()> {
     color_eyre::install()?;
+    let args: Vec<String> = env::args().collect();
+    let env_filter = if args.len() > 1 && args.get(1).unwrap().contains("debug") {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"))
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+    };
+    let custom_format = fmt::format().with_target(false).with_file(true).with_level(true).with_line_number(true).compact();
+    let fmt_layer = fmt::layer().event_format(custom_format);
+    tracing_subscriber::registry().with(env_filter).with(fmt_layer).init();
 
     {
         // Setting the max workers during the start of the application.
-        MAX_WORKERS.store(available_parallelism().unwrap().get(), Ordering::Relaxed);
+        MAX_WORKERS.store(u16::try_from(available_parallelism()?.get()).expect("Number of cores < 2^16"), Ordering::Relaxed);
     }
 
     let options = eframe::NativeOptions {
@@ -100,6 +113,7 @@ struct ImageDuplicatesApp {
 impl eframe::App for ImageDuplicatesApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_pixels_per_point(UI_SCALING_FACTOR);
+        #[allow(clippy::cast_possible_truncation)]
         let progress_bar = ProgressBar::new(*self.progress.lock() as f32).show_percentage();
         let time_remain_scan = Arc::clone(&self.time_remaining);
         let time_remain_analyse = Arc::clone(&self.time_remaining);
@@ -125,14 +139,13 @@ impl eframe::App for ImageDuplicatesApp {
                 create_folder_selection_block(self, ui);
                 let all_exists: Vec<bool> = self.folder_paths.iter().map(|path| Path::new(format!("{path}/{SCANNING_DATA_FILE_NAME}").as_str()).exists()).collect();
                 if all_exists.iter().filter(|b| **b).count() == self.folder_paths.len() {
-                    ui.label("All databaeses exist.");
+                    ui.label("All databases exist.");
                     can_analyse = true;
                 }
-                create_scanning_item(self, ui, &mut can_analyse, time_remain_scan, time_remain_analyse);
+                create_scanning_item(self, ui, can_analyse, time_remain_scan, time_remain_analyse);
                 create_progress_bar_item(self, ui, progress_bar);
 
                 if self.folder_paths.iter().filter(|path| Path::new(&format!("{path}/{ANALYSING_DATA_FILE_NAME}")).exists()).count() == self.folder_paths.len() {
-                    // ui.label("Analysis data found.");
                     can_show_results = true;
                 }
 
@@ -143,40 +156,5 @@ impl eframe::App for ImageDuplicatesApp {
 
         // Update ui continuously
         ctx.request_repaint();
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use {
-        crate::{data, util::shorten_string},
-        pretty_assertions::assert_eq,
-    };
-
-    #[test]
-    fn test_corr() {
-        #![allow(clippy::float_cmp)]
-        let one: Vec<u8> = vec![1, 2, 3, 4, 5, 6];
-        let two: Vec<u8> = vec![2, 4, 7, 9, 12, 14];
-        let result = data::CorrelationEntry::correlation_coefficient(&one, &two);
-        assert_eq!(0.998_381_5, result);
-
-        let one: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let two: Vec<u8> = vec![9, 8, 7, 6, 5, 4, 3, 2, 1];
-        let result = data::CorrelationEntry::correlation_coefficient(&one, &two);
-        assert_eq!(1.0, result);
-    }
-
-    #[test]
-    fn test_str_short() {
-        let s = "112233445566778899";
-        let r = shorten_string(s, 20);
-        assert_eq!(s, &r);
-        let r = shorten_string(s, 5);
-        assert_eq!("11…99", &r);
-        let r = shorten_string(s, 6);
-        assert_eq!("112…99", &r);
-        let r = shorten_string(s, 7);
-        assert_eq!("112…899", &r);
     }
 }

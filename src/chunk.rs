@@ -1,6 +1,6 @@
 use itertools::Itertools;
 
-pub(crate) struct ChunkedCombinations<'a, T> {
+pub struct ChunkedCombinations<'a, T> {
     pub(crate) data: &'a [T],
     pub(crate) k: usize,
     pub(crate) chunk_size: usize,
@@ -8,7 +8,7 @@ pub(crate) struct ChunkedCombinations<'a, T> {
 }
 
 impl<'a, T> ChunkedCombinations<'a, T> {
-    pub(crate) fn new(data: &'a [T], k: usize, chunk_size: usize) -> Self {
+    pub(crate) const fn new(data: &'a [T], k: usize, chunk_size: usize) -> Self {
         ChunkedCombinations { data, k, chunk_size, start_index: 0 }
     }
 }
