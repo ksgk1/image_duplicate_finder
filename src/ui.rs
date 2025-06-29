@@ -1,17 +1,17 @@
 use {
     crate::{
-        AUTO_FORWARD_DIRECTION, Direction, ImageDuplicatesApp, MAX_WORKERS, UNDO_LIST,
-        constants::{POTENTIAL_DUPLICATES_FOLDER, UI_SCALING_FACTOR},
-        data::{self, CorrelationEntry, DataEntry, SUPPORTED_IMAGE_FILE_EXTENSION},
-        progress::LockFreeProgress,
-        util::{force_string_length, shorten_string},
+        constants::{POTENTIAL_DUPLICATES_FOLDER, UI_SCALING_FACTOR}, data::{self, CorrelationEntry, DataEntry, SUPPORTED_IMAGE_FILE_EXTENSION}, progress::LockFreeProgress, util::{force_string_length, shorten_string}, Direction,
+        ImageDuplicatesApp,
+        AUTO_FORWARD_DIRECTION,
+        MAX_WORKERS,
+        UNDO_LIST,
     },
-    eframe::egui::{self, Color32, Image, InnerResponse, RichText, Sense, Ui, Vec2, mutex::Mutex},
+    eframe::egui::{self, mutex::Mutex, Color32, Image, InnerResponse, RichText, Sense, Ui, Vec2},
     std::{
         cmp::Ordering::{Equal, Greater, Less},
         fs,
         path::Path,
-        sync::{Arc, atomic::Ordering},
+        sync::{atomic::Ordering, Arc},
     },
     tracing::{debug, error, info},
 };
@@ -20,19 +20,26 @@ pub fn create_folder_selection_block(app: &mut ImageDuplicatesApp, ui: &mut Ui) 
     let longest_folder_name = app.folder_paths.iter().map(String::len).max().unwrap();
 
     ui.vertical(|ui| {
+        let mut break_loop = false; // cannot break loop from inside ui element
         for (idx, folder) in app.folder_paths.clone().iter().enumerate() {
             ui.horizontal(|ui| {
                 ui.label("Selected folder:");
                 let shortened_folder_path = force_string_length(&folder.clone(), longest_folder_name.min(50));
-                ui.label(
-                    RichText::new(shortened_folder_path) /* .line_height(Some(16.0))*/
-                        .monospace(),
-                );
-                if ui.button("remove").clicked() {
-                    let _ = &app.folder_paths.remove(idx); // can not fail, we get the index from the iterator.
+                ui.label(RichText::new(shortened_folder_path).monospace());
+                ui.add_enabled(!*app.exclude_paths.get(idx).unwrap(), egui::Checkbox::new(app.recursive_paths.get_mut(idx).unwrap(), "Recursive scanning"));
+                if ui.checkbox(app.exclude_paths.get_mut(idx).unwrap(), "Exclude from scanning").clicked() {
+                    *app.recursive_paths.get_mut(idx).unwrap() = false; // deactivate recursive when exclude is selected
                 }
-                ui.checkbox(app.recursive_paths.get_mut(idx).unwrap(), "Recursive scanning");
+                if ui.button("remove").clicked() {
+                    let _ = &app.recursive_paths.remove(idx); // can not fail, we get the index from the iterator
+                    let _ = &app.exclude_paths.remove(idx);
+                    let _ = &app.folder_paths.remove(idx);
+                    break_loop = true;
+                }
             });
+            if break_loop {
+                break; // break loop because indices no longer align after removing an element
+            }
         }
     })
 }
@@ -314,6 +321,7 @@ pub fn create_ui_image_component(ui: &mut Ui, file_path: &str, image: Image, max
 
 pub fn create_scanning_controls(app: &mut ImageDuplicatesApp, ui: &mut Ui, can_analyse: bool) {
     let selected_folders = app.folder_paths.clone();
+    let excluded_folders = app.exclude_paths.clone();
 
     ui.horizontal(|ui| {
         if app.scanning.load(Ordering::Relaxed) {
@@ -327,12 +335,13 @@ pub fn create_scanning_controls(app: &mut ImageDuplicatesApp, ui: &mut Ui, can_a
             analysing.store(false, Ordering::Relaxed);
 
             let folders = selected_folders.clone();
+            let excludes: Vec<String> = selected_folders.iter().zip(excluded_folders.iter()).filter_map(|(folder, &is_excluded)| if is_excluded { Some(folder.clone()) } else { None }).collect();
             let recursive = app.recursive_paths.clone();
             let use_workers = app.workers;
 
             let mut files_to_scan_list = Vec::<String>::new();
             for (folder, &is_recursive) in folders.iter().zip(recursive.iter()) {
-                let mut file_list = DataEntry::generate_file_list(folder, is_recursive);
+                let mut file_list = DataEntry::generate_file_list(folder, is_recursive, None);
                 files_to_scan_list.append(&mut file_list);
             }
 
@@ -340,7 +349,7 @@ pub fn create_scanning_controls(app: &mut ImageDuplicatesApp, ui: &mut Ui, can_a
             app.scan_progress = Some(Arc::clone(&progress_tracker));
 
             std::thread::spawn(move || {
-                DataEntry::scan_folders_with_progress(&folders, &scanning, &recursive, &progress_tracker, use_workers);
+                DataEntry::scan_folders_with_progress(&folders, if excludes.is_empty() { None } else { Some(&excludes) }, &scanning, &recursive, &progress_tracker, use_workers);
             });
         }
 
@@ -363,7 +372,7 @@ pub fn create_scanning_controls(app: &mut ImageDuplicatesApp, ui: &mut Ui, can_a
             app.analysis_progress = Some(Arc::clone(&progress_tracker));
 
             std::thread::spawn(move || {
-                CorrelationEntry::analyse_with_progress(&folders[0], &analysing, &progress_tracker, use_workers);
+                CorrelationEntry::analyse_with_progress_chunked(&folders[0], &analysing, &progress_tracker, use_workers, 1_000_000_000);
             });
         }
 

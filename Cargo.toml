@@ -1,6 +1,6 @@
 [package]
 name = "image_duplicates"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 
 [dependencies]
@@ -38,9 +38,8 @@ codegen-units = 1 # this will slow down the built, but give a 15% increase in pe
 opt-level = 3
 lto = "fat"
 panic = "abort"
-strip = "full" # false for flamegraph analysis
+strip = "symbols" # false for flamegraph analysis
 debug = false # true for flamegraph analysis
-
 
 [features]
 default = ["simd"]

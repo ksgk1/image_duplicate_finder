@@ -15,6 +15,7 @@ pub const ANALYSING_DATA_FILE_NAME: &str = "image_duplicates.corr.dat";
 /// not deleted but ignored for further scans.
 pub const POTENTIAL_DUPLICATES_FOLDER: &str = "potential_duplicates";
 /// Not worth saving if the resemblance is too low, it will only slow down the process and generate unnecessary data.
+#[allow(dead_code)]
 pub const CORRELATION_THRESHOLD: f32 = 0.95;
 /// Defines how many different root scan folders can be used
 pub const MAX_FOLDER_SCANS: usize = 3;

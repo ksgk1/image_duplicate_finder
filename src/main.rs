@@ -1,23 +1,25 @@
+#![feature(sized_hierarchy)]
 #![cfg_attr(feature = "simd", feature(portable_simd))]
+
 use {
     crate::{
         constants::{ANALYSING_DATA_FILE_NAME, APPLICATION_NAME, MAX_FOLDER_SCANS, SCANNING_DATA_FILE_NAME, UI_SCALING_FACTOR, UI_WINDOW_HEIGHT, UI_WINDOW_WIDTH},
         data::{CorrelationEntry, DataEntry},
         progress::LockFreeProgress,
-        ui::{create_comparison_file_element, create_scanning_controls, create_folder_selection_block, create_result_display, create_result_items},
+        ui::{create_comparison_file_element, create_folder_selection_block, create_result_display, create_result_items, create_scanning_controls},
     },
-    eframe::egui::{self, ProgressBar, Ui, mutex::Mutex},
+    eframe::egui::{self, mutex::Mutex, ProgressBar, Ui},
     std::{
         env,
         path::Path,
         process::exit,
         sync::{
-            Arc, LazyLock,
-            atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering}, Arc,
+            LazyLock,
         },
         thread::available_parallelism,
     },
-    tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt},
+    tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter},
 };
 
 mod constants;
@@ -52,7 +54,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let recursive = true;
             let progress_tracker = Arc::new(LockFreeProgress::new(0));
             let workers = u16::try_from(available_parallelism()?.get()).expect("Number of cores < 2^16");
-            DataEntry::scan_folders_with_progress(&[scan_path], &scanning, &[recursive], &progress_tracker, workers);
+            let mut excludes: Vec<String> = Vec::new();
+            for (index, arg) in args.iter().enumerate() {
+                if arg == "--exclude" {
+                    excludes.push(args[index + 1].clone());
+                }
+            }
+            DataEntry::scan_folders_with_progress(&[scan_path], if excludes.is_empty() { None } else { Some(&excludes) }, &scanning, &[recursive], &progress_tracker, workers);
             println!("Scan complete");
             exit(0);
         }
@@ -63,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let data_entries = DataEntry::read_from_folder(&analyse_path).unwrap_or_default();
             let max_possible_combinations = if data_entries.len() > 1 { data_entries.len() * (data_entries.len() - 1) / 2 } else { 1 };
             let progress_tracker = Arc::new(LockFreeProgress::new(max_possible_combinations));
-            CorrelationEntry::analyse_with_progress(&analyse_path, &analysing, &progress_tracker, workers);
+            CorrelationEntry::analyse_with_progress_chunked(&analyse_path, &analysing, &progress_tracker, workers, 1_000_000);
             println!("Analyse complete");
             exit(0);
         }
@@ -101,6 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct ImageDuplicatesApp {
     folder_paths: Vec<String>,
     recursive_paths: Vec<bool>,
+    exclude_paths: Vec<bool>,
     scanning: Arc<AtomicBool>,
     analysing: Arc<AtomicBool>,
     display_images: Arc<AtomicBool>,
@@ -120,6 +129,7 @@ impl Default for ImageDuplicatesApp {
         Self {
             folder_paths: Vec::new(),
             recursive_paths: Vec::new(),
+            exclude_paths: Vec::new(),
             scanning: Arc::new(AtomicBool::new(false)),
             analysing: Arc::new(AtomicBool::new(false)),
             display_images: Arc::new(AtomicBool::new(false)),
@@ -154,6 +164,7 @@ impl eframe::App for ImageDuplicatesApp {
             {
                 self.folder_paths.push(path.display().to_string());
                 self.recursive_paths.push(false); // init new value in recursive vector
+                self.exclude_paths.push(false);
             }
 
             let mut can_analyse = false;

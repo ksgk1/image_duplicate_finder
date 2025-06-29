@@ -1,9 +1,9 @@
 #[cfg(feature = "simd")]
 use std::simd::{f32x8, num::SimdFloat};
-use tracing::debug;
+
 use {
     crate::{
-        constants::{ANALYSING_DATA_FILE_NAME, CORRELATION_THRESHOLD, SCANNING_DATA_FILE_NAME},
+        constants::{ANALYSING_DATA_FILE_NAME, SCANNING_DATA_FILE_NAME},
         progress::LockFreeProgress,
         util,
     },
@@ -20,8 +20,8 @@ use {
         iter::zip,
         path::Path,
         sync::{
-            Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
         },
         time::Instant,
     },
@@ -93,7 +93,6 @@ where
     format!("{folder_path}/{}", T::db_path_name())
 }
 
-
 /// Interface for the different entry types to save the entry to disk.
 trait SaveEntry: Serialize {
     fn save(&self, mutex_file_path: &MutexGuard<File>) -> Result<(), Box<dyn std::error::Error>>;
@@ -113,7 +112,6 @@ where
     }
 }
 
-
 /// Holds the tile data, for a given file.
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DataEntry {
@@ -130,9 +128,9 @@ impl DataEntry {
     /// Generates a list of all potential image files (recursively), that are within the given folder.
     ///
     /// Will only check for jpg/jpeg, png & webp files.
-    pub(crate) fn generate_file_list(folder_path: &str, recursive: bool) -> Vec<String> {
+    pub(crate) fn generate_file_list(folder_path: &str, recursive: bool, exclude: Option<&[String]>) -> Vec<String> {
         let mut file_list = Vec::new();
-        util::visit_dirs(Path::new(folder_path), recursive, &mut |entry| {
+        util::visit_dirs(Path::new(folder_path), recursive, exclude, &mut |entry| {
             if let Some(extension) = entry.extension() {
                 if let Some(ext) = extension.to_ascii_lowercase().to_str() {
                     if SUPPORTED_IMAGE_FILE_EXTENSION.contains(&ext) {
@@ -165,6 +163,10 @@ impl DataEntry {
                     let (image_width, image_height) = decoded_image.dimensions();
                     let tile_width = image_width / TILE_COUNT_PER_SIDE as u32;
                     let tile_height = image_height / TILE_COUNT_PER_SIDE as u32;
+                    if tile_width == 0 || tile_height == 0 {
+                        error!("Image or tile too small to process. File {file_path}");
+                        return tiles_averages;
+                    }
                     for i in 0..TILE_COUNT_PER_SIDE as u32 {
                         for j in 0..TILE_COUNT_PER_SIDE as u32 {
                             let x = i * tile_width;
@@ -238,7 +240,7 @@ impl DataEntry {
 
         info!("Scanning {} files, skipping already scanned files.", files_to_scan.len());
         info!("Using {worker_count} workers");
-        
+
         progress_tracker.reset(files_to_scan.len());
 
         let (result_tx, result_rx) = std::sync::mpsc::channel::<Self>();
@@ -263,7 +265,7 @@ impl DataEntry {
                     }
 
                     // Flush every 100 entries to balance performance and data safety
-                    if value % 100 == 0 {
+                    if value.is_multiple_of(100) {
                         let _ = writer.flush();
                     }
                 }
@@ -301,9 +303,11 @@ impl DataEntry {
             let processed_count = files_processed_clone.fetch_add(1, Ordering::Relaxed) + 1;
             progress_tracker_clone.increment();
 
-            if processed_count % 50 == 0 {
+            if processed_count.is_multiple_of(50) {
                 let (current_processed, total, progress_pct) = progress_tracker_clone.get_progress();
-                if let Some(remaining_time) = progress_tracker_clone.estimated_remaining() {
+                if let Some(remaining_time) = progress_tracker_clone.estimated_remaining()
+                    && processed_count.is_multiple_of(1000)
+                {
                     info!("Processed {}/{} files ({:.1}%), estimated remaining: {:.2?}", current_processed, total, progress_pct * 100.0, remaining_time);
                 }
             }
@@ -320,18 +324,14 @@ impl DataEntry {
 
     /// # Panics
     /// May panic when the given folder can not be accessed.
-    pub fn scan_folders_with_progress(folders: &[String], scanning: &Arc<AtomicBool>, recursive: &[bool], progress_tracker: &Arc<LockFreeProgress>, worker_count: u16) {
+    pub fn scan_folders_with_progress(folders: &[String], exclude: Option<&[String]>, scanning: &Arc<AtomicBool>, recursive: &[bool], progress_tracker: &Arc<LockFreeProgress>, worker_count: u16) {
         let mut files_to_scan_list = Vec::<String>::new();
         for (idx, folder) in folders.iter().enumerate() {
-            let mut file_list_for_folder = Self::generate_file_list(folder, *recursive.get(idx).expect("Folder and recursive arrays should match"));
+            let mut file_list_for_folder = Self::generate_file_list(folder, *recursive.get(idx).expect("Folder and recursive arrays should match"), exclude);
             files_to_scan_list.append(&mut file_list_for_folder);
         }
 
         Self::scan_with_progress(folders.first().expect("At least one folder should be provided"), &files_to_scan_list, scanning, progress_tracker, worker_count);
-    }
-
-    fn to_f32_slice(&self) -> [f32; TOTAL_TILE_COUNT] {
-        CorrelationEntry::vec_u8_to_slice_f32(&self.data)
     }
 }
 
@@ -547,10 +547,12 @@ impl CorrelationEntry {
     }
 
     /// # Panics
-    /// Can panic, if the given folder no longer exists after it was selected via the UI
-    /// Analysis method that properly updates `LockFreeProgress`
-    pub fn analyse_with_progress(folder_path: &str, analysing: &Arc<AtomicBool>, progress_tracker: &Arc<LockFreeProgress>, worker_count: u16) {
-        info!("Using {worker_count} workers.\nAnalysing database in \"{folder_path}\". Calculating correlation coefficients for entries.");
+    /// Panics if the given folder does not exist.
+    /// Analysis method that processes combinations in chunks to handle large datasets
+    pub fn analyse_with_progress_chunked(folder_path: &str, analysing: &Arc<AtomicBool>, progress_tracker: &Arc<LockFreeProgress>, worker_count: u16, max_combinations_per_chunk: usize) {
+        info!("Using {worker_count} workers.\nAnalysing database in \"{folder_path}\" with chunked processing.");
+        info!("Processing {} combinations per chunk", max_combinations_per_chunk);
+
         Self::create_correlation_db(folder_path).expect("Could not create correlation database");
         let db_path = get_db_path::<Self>(folder_path);
 
@@ -562,42 +564,114 @@ impl CorrelationEntry {
             return;
         }
 
+        // Load existing correlations
         let already_performed = Self::read_correlation_db(folder_path).unwrap_or_else(|e| {
             error!("Error reading existing correlations: {e}");
             Vec::<Self>::new()
         });
 
-        // create a set for faster lookup of existing combinations
         let existing_combinations: std::collections::HashSet<(String, String)> = already_performed.iter().map(|entry| (entry.first_path.clone(), entry.second_path.clone())).collect();
 
-        // calculate actual combinations that need to be processed
-        let mut combinations_to_process = Vec::new();
-        for i in 0..data_entries.len() {
-            for j in (i + 1)..data_entries.len() {
-                let first = &data_entries[i].filename;
-                let second = &data_entries[j].filename;
+        info!("Found {} existing correlations", existing_combinations.len());
 
-                if !existing_combinations.contains(&(first.clone(), second.clone())) {
-                    combinations_to_process.push((i, j));
+        // Calculate total possible combinations for progress tracking
+        let total_possible = (data_entries.len() * (data_entries.len() - 1)) / 2;
+        info!("Total possible combinations: {}", total_possible);
+
+        // Process in chunks to avoid memory explosion
+        let mut chunk_start_i = 0;
+        let mut chunk_start_j = 1;
+        let mut total_processed = 0;
+        let mut chunk_number = 0;
+
+        loop {
+            if !analysing.load(Ordering::Relaxed) {
+                info!("Analysis cancelled by user");
+                break;
+            }
+
+            chunk_number += 1;
+            let mut combinations_to_process = Vec::new();
+            let mut combinations_checked = 0;
+
+            info!("Starting chunk {} (from position {}, {})", chunk_number, chunk_start_i, chunk_start_j);
+
+            // Generate one chunk of combinations
+            'outer: for i in chunk_start_i..data_entries.len() {
+                let start_j = if i == chunk_start_i { chunk_start_j } else { i + 1 };
+
+                for j in start_j..data_entries.len() {
+                    combinations_checked += 1;
+
+                    if combinations_checked > max_combinations_per_chunk {
+                        // Save where we left off for next chunk
+                        chunk_start_i = i;
+                        chunk_start_j = j;
+                        break 'outer;
+                    }
+
+                    let first = &data_entries[i].filename;
+                    let second = &data_entries[j].filename;
+
+                    if !existing_combinations.contains(&(first.clone(), second.clone())) {
+                        combinations_to_process.push((i, j));
+                    }
                 }
+
+                // If we finished this i completely, reset j for next i
+                if combinations_checked <= max_combinations_per_chunk {
+                    chunk_start_j = 0; // Will be set to i+1 in next iteration
+                }
+            }
+
+            // Check if we're completely done
+            if combinations_checked == 0 {
+                info!("Finished processing all combinations");
+                break;
+            }
+
+            let chunk_size = combinations_to_process.len();
+            info!("Chunk {}: checked {} combinations, processing {} new ones", chunk_number, combinations_checked, chunk_size);
+
+            if chunk_size > 0 {
+                // Reset progress tracker for this chunk
+                progress_tracker.reset(chunk_size);
+
+                // Process this chunk
+                Self::process_combination_chunk(&data_entries, combinations_to_process, &db_path, analysing, progress_tracker, worker_count);
+            }
+
+            total_processed += combinations_checked;
+            let progress_percent = (total_processed as f64 / total_possible as f64) * 100.0;
+            info!("Overall progress: {}/{} ({:.2}%)", total_processed, total_possible, progress_percent);
+
+            // Check if we've reached the end
+            if chunk_start_i >= data_entries.len() - 1 {
+                info!("Reached end of all combinations");
+                break;
             }
         }
 
-        let total_combinations = combinations_to_process.len();
-        info!("Processing {} new combinations out of {} total possible combinations", total_combinations, data_entries.len() * (data_entries.len() - 1) / 2);
+        analysing.store(false, Ordering::Relaxed);
+        info!("Analysis complete! Total combinations processed: {} out of {} possible", total_processed, total_possible);
+    }
 
-        progress_tracker.reset(total_combinations);
-
-        if total_combinations == 0 {
-            info!("No new combinations to process!");
-            analysing.store(false, Ordering::Relaxed);
+    fn process_combination_chunk(
+        data_entries: &[DataEntry],
+        combinations_to_process: Vec<(usize, usize)>,
+        db_path: &str,
+        analysing: &Arc<AtomicBool>,
+        progress_tracker: &Arc<LockFreeProgress>,
+        worker_count: u16,
+    ) {
+        if combinations_to_process.is_empty() {
             return;
         }
 
         let combinations_processed = Arc::new(AtomicUsize::new(0));
         let work_queue = Arc::new(Mutex::new(combinations_to_process));
 
-        let target_db_file_handle = OpenOptions::new().append(true).open(&db_path).expect("Cannot open file");
+        let target_db_file_handle = OpenOptions::new().append(true).open(db_path).expect("Cannot open file");
         let target_db_file_mutex = Arc::new(Mutex::new(target_db_file_handle));
 
         let start_time = Instant::now();
@@ -607,7 +681,6 @@ impl CorrelationEntry {
                 let files_processed = Arc::clone(&combinations_processed);
                 let worker_db_file = Arc::clone(&target_db_file_mutex);
                 let progress_tracker = Arc::clone(progress_tracker);
-                let data_entries = &data_entries;
 
                 scope.spawn(move |_| {
                     'combinations_loop: while let Some((i, j)) = {
@@ -622,30 +695,33 @@ impl CorrelationEntry {
                         let second_entry = &data_entries[j];
 
                         if first_entry.data.len() != TOTAL_TILE_COUNT || second_entry.data.len() != TOTAL_TILE_COUNT {
-                            debug!("Invalid data length detected, skipping analysis");
                             continue;
                         }
 
-                        // convert to f32 arrays
-                        let first_data: [f32; TOTAL_TILE_COUNT] = first_entry.to_f32_slice();
-                        let second_data: [f32; TOTAL_TILE_COUNT] = second_entry.to_f32_slice();
+                        // Convert to f32 arrays
+                        let first_data: [f32; TOTAL_TILE_COUNT] = Self::vec_u8_to_slice_f32(&first_entry.data);
+                        let second_data: [f32; TOTAL_TILE_COUNT] = Self::vec_u8_to_slice_f32(&second_entry.data);
                         let corr: f32 = Self::correlation_coefficient(&first_data, &second_data);
 
                         let entry = Self::new(&first_entry.filename, &second_entry.filename, corr);
 
-                        if entry.corr > CORRELATION_THRESHOLD {
+                        // always safe
+                        if entry.corr > 0.0
+                        /*CORRELATION_THRESHOLD*/
+                        {
                             let worker_db_file = &worker_db_file.lock();
                             let _ = entry.save(worker_db_file);
                         }
 
+                        // Update progress
                         let processed_count = files_processed.fetch_add(1, Ordering::Relaxed) + 1;
                         progress_tracker.increment();
 
-                        // log progress every 10000 combinations
-                        if processed_count % 10000 == 0 {
+                        // Log progress every 100_000 combinations
+                        if processed_count.is_multiple_of(1_000_000) {
                             let (current_processed, total, progress_pct) = progress_tracker.get_progress();
                             if let Some(remaining_time) = progress_tracker.estimated_remaining() {
-                                info!("Processed {}/{} combinations ({:.1}%), estimated remaining: {:.2?}", current_processed, total, progress_pct * 100.0, remaining_time);
+                                info!("Chunk progress: {}/{} ({:.1}%), estimated remaining: {:.2?}", current_processed, total, progress_pct * 100.0, remaining_time);
                             }
                         }
                     }
@@ -654,9 +730,8 @@ impl CorrelationEntry {
         })
         .unwrap();
 
-        analysing.store(false, Ordering::Relaxed);
-        let elapsed = start_time.elapsed().as_millis();
-        info!("Analysis done! Analysing took: {elapsed} ms");
+        let elapsed = start_time.elapsed();
+        info!("Chunk processing took: {:.2?}", elapsed);
     }
 }
 

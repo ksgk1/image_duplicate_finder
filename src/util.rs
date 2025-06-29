@@ -9,17 +9,25 @@ use {
 /// # Panics
 /// This function panics, if given directory is being given for scanning, but is not existing or was removed.
 /// Visits directories and will execute the callback on each of them. Can be used recursively.
-pub fn visit_dirs(folder_path: &Path, recursive: bool, callback: &mut dyn FnMut(&PathBuf)) {
+pub fn visit_dirs(folder_path: &Path, recursive: bool, exclude: Option<&[String]>, callback: &mut dyn FnMut(&PathBuf)) {
     if folder_path.is_dir() {
         // Do not check our created folder
         if folder_path.display().to_string().contains(POTENTIAL_DUPLICATES_FOLDER) {
             return;
         }
+        if let Some(excludes) = exclude {
+            for exclude in excludes {
+                if folder_path.display().to_string().starts_with(exclude) {
+                    return;
+                }
+            }
+        }
+
         for entry in fs::read_dir(folder_path).unwrap() {
             let entry = entry.unwrap();
             let path = entry.path();
             if path.is_dir() && recursive {
-                visit_dirs(&path, recursive, callback);
+                visit_dirs(&path, recursive, exclude, callback);
             } else {
                 callback(&path);
             }
@@ -36,7 +44,7 @@ pub fn shorten_string(input_string: &str, max_length: usize) -> String {
     }
 
     let half_length = (max_length - 1) / 2; // -1 accounts for the ellipsis
-    let start_slice = if max_length % 2 == 0 { &input_string[..=half_length] } else { &input_string[..half_length] }; // When the desired size is even, we want to take one extra symbol from before the ellipsis.
+    let start_slice = if max_length.is_multiple_of(2) { &input_string[..=half_length] } else { &input_string[..half_length] }; // When the desired size is even, we want to take one extra symbol from before the ellipsis.
     let end_slice = &input_string[input_length - half_length..];
 
     format!("{start_slice}…{end_slice}")
