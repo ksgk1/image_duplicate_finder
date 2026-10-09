@@ -732,17 +732,17 @@ impl CorrelationEntry {
 
         info!("Found {} existing correlations", existing_combinations.len());
 
-        // Count combinations that are already in the database towards progress,
-        // since they will never be sent through the work queue. Without this,
-        // the progress tracker never reaches 100% on re-runs.
-        progress_tracker.increment_batch(existing_combinations.len());
-
         // Calculate total possible combinations for progress tracking
         let total_possible = (entry_count * (entry_count - 1)) / 2;
         info!("Total possible combinations: {}", total_possible);
 
-        // Note: progress_tracker should already be initialized with the correct total
-        // from the calling function. We'll use increment_batch to track progress.
+        // Combinations already in the database never enter the work queue,
+        // so the progress tracker only covers the remaining ones. Crediting
+        // the skipped combinations towards the full total instead would make
+        // an incremental re-run look like a full analysis in the UI.
+        let remaining_combinations = total_possible.saturating_sub(existing_combinations.len());
+        progress_tracker.reset(remaining_combinations);
+        info!("Skipping {} already analysed combinations", existing_combinations.len());
 
         let overall_start_time = Instant::now();
 

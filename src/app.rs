@@ -25,6 +25,7 @@ use {
         collections::HashMap,
         fs,
         path::{Path, PathBuf},
+        process::Command,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -413,7 +414,26 @@ impl ImageDuplicatesApp {
         Some((cached_image_dimensions(dimensions, first_path)?, cached_image_dimensions(dimensions, second_path)?))
     }
 
-    // -- file actions -----------------------------------------------------
+    /// Opens the folder containing `file_path` in the system file manager
+    /// (Explorer on Windows, Finder on macOS, `xdg-open` elsewhere).
+    pub fn open_containing_folder(&mut self, file_path: &str) {
+        let Some(folder) = Path::new(file_path).parent() else {
+            return;
+        };
+        if folder.as_os_str().is_empty() {
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        let command = "explorer";
+        #[cfg(target_os = "macos")]
+        let command = "open";
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let command = "xdg-open";
+        if let Err(e) = Command::new(command).arg(folder).spawn() {
+            error!("Could not open folder {folder:?} in the file manager: {e}");
+            self.status = Some(format!("Could not open the folder in the file manager: {e}"));
+        }
+    }
 
     /// Moves `file_path` into the `potential_duplicates` subfolder of the
     /// first selected folder and records the move for undo.

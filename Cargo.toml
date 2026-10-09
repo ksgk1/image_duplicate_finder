@@ -2,7 +2,7 @@
     authors = ["ksgk1"]
     edition = "2024"
     name    = "image_duplicate_finder"
-    version = "0.8.1"
+    version = "0.9.0"
 
 [dependencies]
     crossbeam          = { version = "0.8.5" }

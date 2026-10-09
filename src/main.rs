@@ -4,9 +4,9 @@ use {
     crate::{
         app::ImageDuplicatesApp,
         constants::{APPLICATION_NAME, MAX_FOLDER_SCANS, SCANNING_DATA_FILE_NAME, UI_SCALING_FACTOR, UI_WINDOW_HEIGHT, UI_WINDOW_WIDTH},
-        data::{CorrelationEntry, DataEntry},
+        data::{CorrelationEntry, DataEntry, get_db_path},
         progress::LockFreeProgress,
-        ui::{create_comparison_file_element, create_folder_selection_block, create_result_display, create_result_items, create_scanning_controls},
+        ui::{create_bottom_bar, create_result_display, create_setup_panel, create_top_bar},
     },
     eframe::egui::{self, ProgressBar, Ui},
     std::{
@@ -102,33 +102,29 @@ impl eframe::App for ImageDuplicatesApp {
         ui.set_pixels_per_point(UI_SCALING_FACTOR);
         self.cleanup_completed_operations();
 
-        let progress_value = self.get_current_progress();
-        let progress_bar = ProgressBar::new(progress_value).show_percentage();
+        let progress_bar = ProgressBar::new(self.get_current_progress()).show_percentage();
+        let can_analyse = self.folders.iter().all(|folder| Path::new(&folder.path).join(SCANNING_DATA_FILE_NAME).exists());
+        let has_analysis_data = self.folders.first().is_some_and(|folder| Path::new(&get_db_path::<CorrelationEntry>(&folder.path)).exists());
+
+        egui::Panel::top("top_bar").show(ui, |ui| {
+            create_top_bar(self, ui);
+        });
+
+        egui::Panel::left("setup_panel").default_size(300.0).min_size(240.0).show(ui, |ui| {
+            create_setup_panel(self, ui, can_analyse, has_analysis_data);
+        });
+
+        egui::Panel::bottom("bottom_bar").show(ui, |ui| {
+            create_bottom_bar(self, ui, progress_bar, can_analyse, has_analysis_data);
+        });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.label("Select a folder to be scanned. You can select up to 3 folders.");
-
-            if self.folders.len() < MAX_FOLDER_SCANS
-                && ui.button("Select folder…").clicked()
-                && let Some(path) = rfd::FileDialog::new().pick_folder()
-            {
-                self.add_folder(path.display().to_string());
-            }
-
-            if !self.folders.is_empty() {
-                create_folder_selection_block(self, ui);
-
-                let can_analyse = self.folders.iter().all(|folder| Path::new(&folder.path).join(SCANNING_DATA_FILE_NAME).exists());
-                if can_analyse {
-                    ui.label("All databases exist.");
-                }
-                create_scanning_controls(self, ui, can_analyse);
-                self.create_progress_display(ui, progress_bar);
-
-                create_comparison_file_element(self, ui);
-
-                create_result_items(self, ui);
+            if self.display_results {
                 create_result_display(self, ui);
+            } else if self.folders.is_empty() {
+                ui.centered_and_justified(|ui| ui.strong("Select a folder in the panel on the left to begin."));
+            } else {
+                ui.centered_and_justified(|ui| ui.strong("Scan and analyse your folders, then show the results from the panel on the left."));
             }
         });
 
@@ -240,17 +236,19 @@ impl ImageDuplicatesApp {
         let analysing = self.analysing.load(Ordering::Relaxed);
 
         if scanning || analysing {
-            ui.add(progress_bar);
+            ui.horizontal(|ui| {
+                ui.add(progress_bar.desired_width(240.0));
 
-            let operation_status = self.get_current_operation_status();
-            if !operation_status.is_empty() {
-                ui.label(operation_status);
-            }
+                let operation_status = self.get_current_operation_status();
+                if !operation_status.is_empty() {
+                    ui.label(operation_status);
+                }
 
-            let time_remaining = self.get_estimated_time_remaining();
-            if !time_remaining.is_empty() {
-                ui.label(time_remaining);
-            }
+                let time_remaining = self.get_estimated_time_remaining();
+                if !time_remaining.is_empty() {
+                    ui.label(time_remaining);
+                }
+            });
         }
     }
 }

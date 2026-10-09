@@ -58,19 +58,6 @@ pub fn shorten_string(input_string: &str, max_length: usize) -> String {
     format!("{start_slice}…{end_slice}")
 }
 
-/// Will shorten the string if it is too long, otherwise pads it with spaces to force the desired length.
-#[must_use]
-pub fn force_string_length(input_string: &str, max_length: usize) -> String {
-    let mut padded = input_string.to_string();
-    let current_len = input_string.len();
-    if current_len < max_length {
-        let padding = max_length - current_len;
-        padded.push_str(&" ".repeat(padding));
-        return padded;
-    }
-    shorten_string(input_string, max_length)
-}
-
 /// Checks whether the file has a supported image extension (case-insensitive).
 #[must_use]
 pub fn has_valid_image_extension(file_path: &Path) -> bool {
