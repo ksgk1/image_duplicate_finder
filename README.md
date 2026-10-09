@@ -1,12 +1,12 @@
 # Image duplicate finder
 
-This tool can scan and analyses images in a given folder and allows the user to check if there are duplicates. The self-made algorithm used is dividing the images into `4x4` tiles and calculate the tile's average pixel value (brightness). The brightness levels of all images are then compared and a [correlation coefficient](https://en.wikipedia.org/wiki/Pearson_correlation_coefficient) is calculated for each pair. The user can select how many workers (threads) are used for the scanning and analysing steps.
+This tool can scan and analyses images in a given folder and allows the user to check if there are duplicates. The self-made algorithm used is dividing the images into `4x4` tiles and calculate the tile's average pixel value (brightness). The brightness levels of all images are then compared and a [correlation coefficient](https://en.wikipedia.org/wiki/Pearson_correlation_coefficient) is calculated for each pair. This simplifaction allows to also find rotated, and mirrored images, since the values are just reordered. SIMD was used to speed up the process.
+
+The user can select how many workers (threads) are used for the scanning and analysing steps, but there are diminishing returns, since small work packages are slowed down by the overhead of distributing the work.
 
 The code still has some TODO markers, which are ideas for future improvements. The current state has only been tested by the author.
 
 Selection of the duplicate can be done by clicking on the presented image.
-
-
 
 ## Features
 * Finding similarities in images, even if they have different dimensions
@@ -15,9 +15,9 @@ Selection of the duplicate can be done by clicking on the presented image.
 * Already selected duplicates will not be processed again
 * Duplicate candidates are moved to a folder and are not deleted
 * Undo actions to undo a move action
+* Finding a given image in the dataset
 
 ## Shortcomings
-* UI is lacking deletion functions for the database files
 * Database files are plaintext files, each JSON lines (may change in the future).
 * JPEG/PNG are supported, malformed image headers are ignored.
 * Documentation is WIP
