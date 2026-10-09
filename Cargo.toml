@@ -1,50 +1,46 @@
 [package]
-name = "image_duplicates"
-version = "0.6.0"
-edition = "2024"
+    authors = ["ksgk1"]
+    edition = "2024"
+    name    = "image_duplicates"
+    version = "0.8.0"
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-eframe = { version = "0.31", features = ["default"] }
-egui_extras = { version = "0.31", features = ["default", "file", "image"] }
-image = { version = "0.25.2", features = [
-    "jpeg",
-    "png",
-    "rayon",
-    "webp",
-] } # 0.25.1 for egui_extras
-rfd = { version = "0.15" }
-rayon = "1.10"
-crossbeam = "0.8"
-tracing = { version = "0.1" }
-tracing-subscriber = { version = "0.3", default-features = false, features = [
-    "ansi",
-    "fmt",
-    "env-filter",
-] }
+    crossbeam          = { version = "0.8.5" }
+    eframe             = { version = "0.36.2", features = ["default"] }
+    egui_extras        = { version = "0.36.2", default-features = false, features = ["file", "image"] }
+    image              = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+    rayon              = { version = "1.12.0" }
+    rfd                = { version = "0.17.2" }
+    serde              = { version = "1.0.229", features = ["derive"] }
+    serde_json         = { version = "1.0.151", default-features = false, features = ["std"] }
+    thiserror          = { version = "2.0.21" }
+    tracing            = { version = "0.1.44" }
+    tracing-subscriber = { version = "0.3.20", default-features = false, features = ["ansi", "fmt", "env-filter"] }
 
 [dev-dependencies]
-pretty_assertions = "1.4"
-criterion = { version = "0.6", features = ["html_reports"] }
+    criterion         = { version = "0.8.2", features = ["html_reports"] }
+    pretty_assertions = { version = "1.4.1" }
 
 [lints.clippy]
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
-cast_precision_loss = "allow" # for usize to f32 conversion
+    cast_precision_loss = "allow"                           # for usize to f32 conversion
+    correctness         = { level = "deny", priority = -1 }
+    nursery             = { level = "deny", priority = -1 }
+    pedantic            = { level = "deny", priority = -1 }
+    perf                = { level = "deny", priority = -1 }
+    unwrap_used         = "deny"
 
 [profile.release]
-codegen-units = 1 # this will slow down the built, but give a 15% increase in performance.
-opt-level = 3
-lto = "fat"
-panic = "abort"
-strip = "symbols" # false for flamegraph analysis
-debug = false # true for flamegraph analysis
+    codegen-units = 1         # this will slow down the built, but give a 15% increase in performance.
+    debug         = false     # true for flamegraph analysis
+    lto           = "fat"
+    opt-level     = 3
+    panic         = "abort"
+    strip         = "symbols" # false for flamegraph analysis
 
 [features]
-default = ["simd"]
-simd = []
+    default = ["simd"]
+    simd    = []
 
 [[bench]]
-name = "correlation_benchmark"
-harness = false
+    harness = false
+    name    = "correlation_benchmark"

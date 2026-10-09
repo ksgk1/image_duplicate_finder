@@ -1,9 +1,10 @@
 use {
-    crate::constants::POTENTIAL_DUPLICATES_FOLDER,
+    crate::constants::{POTENTIAL_DUPLICATES_FOLDER, SUPPORTED_IMAGE_FILE_EXTENSION},
     std::{
         fs,
         path::{Path, PathBuf},
     },
+    tracing::error,
 };
 
 /// # Panics
@@ -23,13 +24,20 @@ pub fn visit_dirs(folder_path: &Path, recursive: bool, exclude: Option<&[String]
             }
         }
 
-        for entry in fs::read_dir(folder_path).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            if path.is_dir() && recursive {
-                visit_dirs(&path, recursive, exclude, callback);
-            } else {
-                callback(&path);
+        match fs::read_dir(folder_path) {
+            Ok(iter) => {
+                for entry in iter {
+                    let entry = entry.expect("Entry is valid.");
+                    let path = entry.path();
+                    if path.is_dir() && recursive {
+                        visit_dirs(&path, recursive, exclude, callback);
+                    } else {
+                        callback(&path);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("error reading directory {:?}: {}", folder_path, e);
             }
         }
     }
@@ -63,9 +71,30 @@ pub fn force_string_length(input_string: &str, max_length: usize) -> String {
     shorten_string(input_string, max_length)
 }
 
+/// Checks whether the file has a supported image extension (case-insensitive).
+#[must_use]
+pub fn has_valid_image_extension(file_path: &Path) -> bool {
+    file_path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| SUPPORTED_IMAGE_FILE_EXTENSION.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+/// Checks whether two files have matching extensions (case-insensitive).
+/// `jpg` and `jpeg` are the same format and therefore match each other.
+#[must_use]
+pub fn have_matching_extensions(file_path1: &Path, file_path2: &Path) -> bool {
+    let normalize = |path: &Path| path.extension().and_then(|ext| ext.to_str()).map(|ext| if ext.eq_ignore_ascii_case("jpeg") { "jpg".to_string() } else { ext.to_ascii_lowercase() });
+    match (normalize(file_path1), normalize(file_path2)) {
+        (Some(ext1), Some(ext2)) => ext1 == ext2,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use {crate::util::shorten_string, pretty_assertions::assert_eq};
+    use {
+        crate::util::{has_valid_image_extension, have_matching_extensions, shorten_string},
+        pretty_assertions::assert_eq,
+        std::path::Path,
+    };
 
     #[test]
     fn test_str_short() {
@@ -78,5 +107,28 @@ mod tests {
         assert_eq!("112…99", &r);
         let r = shorten_string(s, 7);
         assert_eq!("112…899", &r);
+    }
+
+    #[test]
+    fn test_valid_image_extension() {
+        assert!(has_valid_image_extension(Path::new("/some/folder/pic.png")));
+        assert!(has_valid_image_extension(Path::new("pic.JPG"))); // case-insensitive
+        assert!(has_valid_image_extension(Path::new("pic.jpeg")));
+        assert!(has_valid_image_extension(Path::new("pic.webp")));
+        assert!(!has_valid_image_extension(Path::new("pic.gif")));
+        assert!(!has_valid_image_extension(Path::new("noext")));
+        assert!(!has_valid_image_extension(Path::new("")));
+    }
+
+    #[test]
+    fn test_matching_extensions() {
+        assert!(have_matching_extensions(Path::new("a/img1.jpg"), Path::new("b/img2.jpg")));
+        assert!(have_matching_extensions(Path::new("a/img1.jpg"), Path::new("b/img2.JPG"))); // case-insensitive
+        assert!(have_matching_extensions(Path::new("a/img1.jpg"), Path::new("b/img2.jpeg"))); // same format
+        assert!(have_matching_extensions(Path::new("a/img1.jpeg"), Path::new("b/img2.JPG"))); // same format, mixed case
+        assert!(!have_matching_extensions(Path::new("a/img1.png"), Path::new("b/img2.jpg")));
+        assert!(!have_matching_extensions(Path::new("a/img1"), Path::new("b/img2.jpg"))); // missing extension
+        assert!(!have_matching_extensions(Path::new("a/img1.jpg"), Path::new("b/img2"))); // missing extension
+        assert!(!have_matching_extensions(Path::new("a/img1"), Path::new("b/img2"))); // both missing
     }
 }

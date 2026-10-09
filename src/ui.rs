@@ -1,412 +1,300 @@
+//! # UI Module
+//!
+//! User interface rendering for the image duplicates application.
+//!
+//! This module only draws the current application state and forwards user
+//! input. All state mutations, file system access and thread management
+//! live in [`crate::app::ImageDuplicatesApp`]; the functions here call its
+//! action methods and never touch the file system themselves.
+
 use {
     crate::{
-        constants::{POTENTIAL_DUPLICATES_FOLDER, UI_SCALING_FACTOR}, data::{self, CorrelationEntry, DataEntry, SUPPORTED_IMAGE_FILE_EXTENSION}, progress::LockFreeProgress, util::{force_string_length, shorten_string}, Direction,
-        ImageDuplicatesApp,
-        AUTO_FORWARD_DIRECTION,
-        MAX_WORKERS,
-        UNDO_LIST,
+        app::ImageDuplicatesApp,
+        constants::{SUPPORTED_IMAGE_FILE_EXTENSION, UI_SCALING_FACTOR},
+        data::{self, CorrelationEntry},
+        util::{force_string_length, has_valid_image_extension, have_matching_extensions, shorten_string},
     },
-    eframe::egui::{self, mutex::Mutex, Color32, Image, InnerResponse, RichText, Sense, Ui, Vec2},
+    eframe::egui::{self, Color32, Image, RichText, Sense, Ui},
     std::{
         cmp::Ordering::{Equal, Greater, Less},
         fs,
         path::Path,
-        sync::{atomic::Ordering, Arc},
+        sync::atomic::Ordering,
     },
-    tracing::{debug, error, info},
+    tracing::error,
 };
 
-pub fn create_folder_selection_block(app: &mut ImageDuplicatesApp, ui: &mut Ui) -> InnerResponse<()> {
-    let longest_folder_name = app.folder_paths.iter().map(String::len).max().unwrap();
+/// Which results button the UI should render in a frame. Rendering both at
+/// once must never happen, so the choice is exclusive by state, not by click.
+#[derive(Debug, PartialEq, Eq)]
+enum ResultsButton {
+    CloseResults,
+    ShowResults,
+    None,
+}
+
+/// Decides which results button to render: while results are open only
+/// "Close results" is offered, while a scan or analysis is running no button
+/// is offered, otherwise "Show results".
+const fn results_button_state(display_results: bool, analysing: bool, scanning: bool) -> ResultsButton {
+    if display_results {
+        ResultsButton::CloseResults
+    } else if !analysing && !scanning {
+        ResultsButton::ShowResults
+    } else {
+        ResultsButton::None
+    }
+}
+
+/// Renders the list of selected folders with their options and remove button.
+///
+/// # Panics
+/// If called without any folder selected.
+pub fn create_folder_selection_block(app: &mut ImageDuplicatesApp, ui: &mut Ui) {
+    let longest_folder_name = app.folders.iter().map(|folder| folder.path.len()).max().expect("Called only with at least one folder selected");
 
     ui.vertical(|ui| {
-        let mut break_loop = false; // cannot break loop from inside ui element
-        for (idx, folder) in app.folder_paths.clone().iter().enumerate() {
+        let mut remove_idx = None;
+        for (idx, folder) in app.folders.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.label("Selected folder:");
-                let shortened_folder_path = force_string_length(&folder.clone(), longest_folder_name.min(50));
-                ui.label(RichText::new(shortened_folder_path).monospace());
-                ui.add_enabled(!*app.exclude_paths.get(idx).unwrap(), egui::Checkbox::new(app.recursive_paths.get_mut(idx).unwrap(), "Recursive scanning"));
-                if ui.checkbox(app.exclude_paths.get_mut(idx).unwrap(), "Exclude from scanning").clicked() {
-                    *app.recursive_paths.get_mut(idx).unwrap() = false; // deactivate recursive when exclude is selected
+                ui.label(RichText::new(force_string_length(&folder.path, longest_folder_name.min(50))).monospace());
+                ui.add_enabled(!folder.excluded, egui::Checkbox::new(&mut folder.recursive, "Recursive scanning"));
+                if ui.checkbox(&mut folder.excluded, "Exclude from scanning").changed() && folder.excluded {
+                    folder.recursive = false; // deactivate recursive when the folder is excluded
                 }
-                if ui.button("remove").clicked() {
-                    let _ = &app.recursive_paths.remove(idx); // can not fail, we get the index from the iterator
-                    let _ = &app.exclude_paths.remove(idx);
-                    let _ = &app.folder_paths.remove(idx);
-                    break_loop = true;
+                if ui.button("Remove").clicked() {
+                    remove_idx = Some(idx);
                 }
             });
-            if break_loop {
-                break; // break loop because indices no longer align after removing an element
+            if remove_idx.is_some() {
+                break; // indices no longer align after removing an element
             }
         }
-    })
-}
-
-pub fn create_result_items(app: &ImageDuplicatesApp, ui: &mut Ui, can_analyse: bool, can_show_results: bool) {
-    let analysing = app.analysing.load(Ordering::Relaxed);
-    let scanning = app.scanning.load(Ordering::Relaxed);
-    if !analysing && !scanning && can_analyse {
-        if app.display_images.load(Ordering::Relaxed) && ui.button("Close results").clicked() {
-            app.correlation_data.lock().clear();
-            app.display_images.store(false, Ordering::Relaxed);
-        } else if can_show_results && ui.button("Show results").clicked() {
-            for folder in app.folder_paths.clone() {
-                #[allow(clippy::collection_is_never_read)]
-                let mut folder_correlation_data: Vec<CorrelationEntry> = CorrelationEntry::read_correlation_db(&folder).unwrap().iter().filter(|e| e.corr > 0.9).cloned().collect();
-                if !app.find_image_path.lock().is_empty() {
-                    let comparison_file = app.find_image_path.lock().clone();
-                    folder_correlation_data.retain(|item| item.first_path == comparison_file || item.second_path == comparison_file);
-                }
-                folder_correlation_data.clone_into(&mut app.correlation_data.lock());
-            }
-
-            if app.correlation_data.lock().is_empty() {
-                ui.label(format!("No correlation data found for Image: {}", app.find_image_path.lock().clone()));
-            }
-
-            app.display_images.store(true, Ordering::Relaxed);
-            {
-                let c_data = app.correlation_data.lock();
-                if let Some(entry) = c_data.get(app.correlation_entry_idx.load(Ordering::Relaxed)) {
-                    app.first_path.lock().clone_from(&entry.first_path);
-                    app.second_path.lock().clone_from(&entry.second_path);
-                } else {
-                    app.first_path.lock().clone_from(&String::new());
-                    app.second_path.lock().clone_from(&String::new());
-                }
-                drop(c_data);
-            }
-        }
-    }
-}
-
-pub fn create_result_display(app: &ImageDuplicatesApp, ui: &mut Ui, image_clicked: &Arc<Mutex<String>>) {
-    if app.display_images.load(Ordering::Relaxed) {
-        ui.horizontal(|ui| {
-            previous_button(app, ui);
-            next_button(app, ui);
-            let first_path_exists = Path::new(&app.first_path.lock().clone()).exists();
-            let second_path_exists = Path::new(&app.second_path.lock().clone()).exists();
-            if !first_path_exists || !second_path_exists {
-                let mut idx = app.correlation_entry_idx.load(Ordering::Relaxed);
-                let mut direction = AUTO_FORWARD_DIRECTION.lock();
-                match *direction {
-                    Direction::Forwards => {
-                        if idx < (app.correlation_data.lock().len() - 1) {
-                            idx += 1;
-                        } else {
-                            idx = 0;
-                        }
-                    }
-                    Direction::Backwards => {
-                        if idx > 0 {
-                            idx -= 1;
-                        } else {
-                            idx = app.correlation_data.lock().len() - 1;
-                        }
-                    }
-                    Direction::None => {
-                        if idx < (app.correlation_data.lock().len() - 1) {
-                            idx += 1;
-                        } else {
-                            idx = 0;
-                        }
-                        *direction = Direction::Forwards;
-                    }
-                }
-                drop(direction);
-                app.correlation_entry_idx.store(idx, Ordering::Relaxed);
-                set_image_paths(app, idx);
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Clicking on the images moves them into the \"potential_duplicates\" folder. Clicking the button will replace the smaller one.").color(Color32::RED));
-            {
-                let mut undo_list = UNDO_LIST.lock();
-                if !undo_list.is_empty() && ui.button("Restore last move").clicked() {
-                    match undo_list.pop() {
-                        Some(original_path) => {
-                            let duplicate_file_name = Path::new(&original_path).file_name().unwrap().to_str().unwrap();
-                            let selected_folder = Path::new(&original_path).parent().expect("Could not get dir of file").display().to_string();
-                            let duplicate_file_path = format!("{selected_folder}/{POTENTIAL_DUPLICATES_FOLDER}/{duplicate_file_name}");
-                            match fs::rename(duplicate_file_path, &original_path) {
-                                Ok(()) => info!("Restored {original_path}"),
-                                Err(e) => {
-                                    error!("Failed to restore {original_path}. Error: {e}");
-                                }
-                            }
-                        }
-                        None => {
-                            debug!("Could not get item from undo list");
-                        }
-                    }
-                }
-            }
-        });
-
-        let first_path = &app.first_path.lock().clone();
-        let second_path = &app.second_path.lock().clone();
-
-        if first_path.is_empty() || second_path.is_empty() {
-            app.display_images.store(false, Ordering::Relaxed);
-        }
-
-        let image1 = Image::new(format!("file://{}", &first_path));
-        let image2 = Image::new(format!("file://{}", &second_path));
-
-        let available_size = ui.available_size();
-        display_images(ui, image_clicked, first_path, second_path, image1, image2, available_size);
-
-        {
-            let c_data = app.correlation_data.lock();
-            if let Some(corr) = &c_data.get(app.correlation_entry_idx.load(Ordering::Relaxed)) {
-                ui.label(format!("Resemblance: {:.2}%", corr.corr * 100.0));
-            }
-            drop(c_data);
-        }
-    }
-}
-
-fn set_image_paths(app: &ImageDuplicatesApp, idx: usize) {
-    {
-        let c_data = app.correlation_data.lock();
-        if let Some(entry) = c_data.get(idx) {
-            app.first_path.lock().clone_from(&entry.first_path);
-            app.second_path.lock().clone_from(&entry.second_path);
-        }
-        drop(c_data);
-    }
-}
-
-fn display_images(ui: &mut Ui, image_clicked: &Arc<Mutex<String>>, first_path: &String, second_path: &String, image1: Image, image2: Image, available_size: Vec2) {
-    ui.horizontal(|ui| {
-        // cannot calculate the sizing inside, since it changes after the first image is inserted
-        if first_path.is_empty() {
-            info!("First path is empty, nothing to display");
-            return;
-        }
-        let (w1, h1) = match image::ImageReader::open(first_path) {
-            Ok(image) => image.into_dimensions().unwrap_or_default(),
-            Err(e) => {
-                error!("Error while reading file {first_path}: {e:?}");
-                (0, 0)
-            }
-        };
-
-        if second_path.is_empty() {
-            info!("Second path is empty, nothing to display");
-            return;
-        }
-        let (w2, h2) = match image::ImageReader::open(second_path) {
-            Ok(image) => image.into_dimensions().unwrap_or_default(),
-            Err(e) => {
-                error!("Error while reading file {second_path}: {e:?}");
-                (0, 0)
-            }
-        };
-
-        let mut higher_res_1 = false;
-        let mut higher_res_2 = false;
-        let dimensions_comparison = (w1 * h1).cmp(&(w2 * h2));
-        match dimensions_comparison {
-            Less => {
-                higher_res_2 = true;
-            }
-            Equal => {}
-            Greater => {
-                higher_res_1 = true;
-            }
-        }
-
-        // 4 lines of text, each line is around 12 px in height.
-        // Removing 25 px for the button between them
-        let image_info_height = 4.0 * 12.0 * UI_SCALING_FACTOR;
-        create_ui_image_component(ui, first_path, image1, (available_size.x / 2.0 - 25.0, available_size.y - image_info_height), image_clicked, /*&selected_folder,*/ higher_res_1);
-        match dimensions_comparison {
-            Less => {
-                if ui.button("<-").clicked() {
-                    info!("Overwriting {second_path} → {first_path}");
-                    fs::rename(second_path, first_path).expect("Can not fail, unless files were altered in the meantime.");
-                    // TODO: Remove entries from database
-                }
-            }
-            Equal => {
-                ui.label("  ");
-            }
-            Greater => {
-                if ui.button("->").clicked() {
-                    info!("Overwriting {first_path} → {second_path}");
-                    fs::rename(first_path, second_path).expect("Can not fail, unless files were altered in the meantime.");
-                    // TODO: Remove entries from database
-                }
-            }
-        }
-        create_ui_image_component(ui, second_path, image2, (available_size.x / 2.0 - 25.0, available_size.y - image_info_height), image_clicked, /*&selected_folder,*/ higher_res_2);
-    });
-}
-
-fn previous_button(app: &ImageDuplicatesApp, ui: &mut Ui) {
-    if ui.button("Previous").clicked() {
-        let mut idx = app.correlation_entry_idx.load(Ordering::Relaxed);
-        *AUTO_FORWARD_DIRECTION.lock() = Direction::Backwards;
-        if idx > 0 {
-            idx -= 1;
-        } else {
-            idx = app.correlation_data.lock().len() - 1;
-        }
-        app.correlation_entry_idx.store(idx, Ordering::Relaxed);
-
-        set_image_paths(app, idx);
-    }
-}
-
-fn next_button(app: &ImageDuplicatesApp, ui: &mut Ui) {
-    if ui.button("Next").clicked() {
-        let mut idx = app.correlation_entry_idx.load(Ordering::Relaxed);
-        *AUTO_FORWARD_DIRECTION.lock() = Direction::Forwards;
-        if idx < (app.correlation_data.lock().len() - 1) {
-            idx += 1;
-        } else {
-            idx = 0;
-        }
-        app.correlation_entry_idx.store(idx, Ordering::Relaxed);
-
-        set_image_paths(app, idx);
-    }
-}
-
-pub fn create_ui_image_component(ui: &mut Ui, file_path: &str, image: Image, max_size: (f32, f32), to_delete: &Arc<Mutex<String>>, higher_res: bool) {
-    if file_path.is_empty() {
-        info!("File path is empty");
-        return;
-    }
-    let filename = Path::new(&file_path).file_name().unwrap_or_default().to_str().unwrap_or_default();
-    let display_filename = shorten_string(filename, 37);
-    let scaled_image = image.fit_to_original_size(1.0).max_width(max_size.0).max_height(max_size.1).sense(Sense::click());
-    let fallback_folder = Path::new(&file_path).parent().expect("Could not get dirname from file").display().to_string();
-    let root_folder = Path::new(&to_delete.lock().to_string()).parent().unwrap_or_else(|| Path::new(&fallback_folder)).display().to_string();
-    let duplicate_folder_path = format!("{root_folder}/{POTENTIAL_DUPLICATES_FOLDER}");
-    ui.vertical(|ui| {
-        match image::ImageReader::open(file_path) {
-            Ok(image) => {
-                let (width, height) = image.into_dimensions().expect("Could not get dimensions");
-                let stroke_colour = if higher_res { Color32::GREEN } else { Color32::TRANSPARENT };
-                egui::Frame::default().inner_margin(2.0).fill(stroke_colour).show(ui, |ui| {
-                    if ui.add(scaled_image).clicked() {
-                        if !Path::new(&duplicate_folder_path).exists() {
-                            let _ = fs::create_dir(&duplicate_folder_path);
-                        }
-                        {
-                            let mut u_list = UNDO_LIST.lock();
-                            u_list.push(file_path.to_string());
-                        }
-                        let _ = fs::rename(file_path, format!("{duplicate_folder_path}/{filename}"));
-                        let mut binding = to_delete.lock();
-                        *binding = file_path.to_string();
-                    }
-                });
-                ui.label(display_filename);
-                ui.label(format!("Parent folder: {}", shorten_string(Path::new(file_path).parent().unwrap().file_name().unwrap().to_str().unwrap(), 30)));
-                ui.label(format!("Image dimensions: {width}x{height}"));
-            }
-            Err(e) => {
-                /*eprint!("Could not open image {e}")*/
-                drop(e);
-            }
+        if let Some(idx) = remove_idx {
+            app.folders.remove(idx);
         }
     });
 }
 
+/// Renders the scan/analyse controls, the worker slider and the
+/// "Delete analysis data" button.
 pub fn create_scanning_controls(app: &mut ImageDuplicatesApp, ui: &mut Ui, can_analyse: bool) {
-    let selected_folders = app.folder_paths.clone();
-    let excluded_folders = app.exclude_paths.clone();
-
     ui.horizontal(|ui| {
         if app.scanning.load(Ordering::Relaxed) {
             if ui.button("Stop scanning").clicked() {
-                app.scanning.store(false, Ordering::Relaxed);
+                app.stop_scan();
             }
         } else if ui.button("Start scanning").clicked() {
-            let scanning = Arc::clone(&app.scanning);
-            scanning.store(true, Ordering::Relaxed);
-            let analysing = Arc::clone(&app.analysing);
-            analysing.store(false, Ordering::Relaxed);
-
-            let folders = selected_folders.clone();
-            let excludes: Vec<String> = selected_folders.iter().zip(excluded_folders.iter()).filter_map(|(folder, &is_excluded)| if is_excluded { Some(folder.clone()) } else { None }).collect();
-            let recursive = app.recursive_paths.clone();
-            let use_workers = app.workers;
-
-            let mut files_to_scan_list = Vec::<String>::new();
-            for (folder, &is_recursive) in folders.iter().zip(recursive.iter()) {
-                let mut file_list = DataEntry::generate_file_list(folder, is_recursive, None);
-                files_to_scan_list.append(&mut file_list);
-            }
-
-            let progress_tracker = Arc::new(LockFreeProgress::new(files_to_scan_list.len()));
-            app.scan_progress = Some(Arc::clone(&progress_tracker));
-
-            std::thread::spawn(move || {
-                DataEntry::scan_folders_with_progress(&folders, if excludes.is_empty() { None } else { Some(&excludes) }, &scanning, &recursive, &progress_tracker, use_workers);
-            });
+            app.start_scan();
         }
 
         if app.analysing.load(Ordering::Relaxed) {
             if ui.button("Stop analysing").clicked() {
-                app.analysing.store(false, Ordering::Relaxed);
+                app.stop_analysis();
             }
         } else if can_analyse && !app.scanning.load(Ordering::Relaxed) && ui.button("Analyse data").clicked() {
-            let analysing = Arc::clone(&app.analysing);
-            analysing.store(true, Ordering::Relaxed);
-            let scanning = Arc::clone(&app.scanning);
-            scanning.store(false, Ordering::Relaxed);
-
-            let folders = selected_folders.clone();
-            let use_workers = app.workers;
-            let data_entries = DataEntry::read_from_folder(&folders[0]).unwrap_or_default();
-            let max_possible_combinations = if data_entries.len() > 1 { data_entries.len() * (data_entries.len() - 1) / 2 } else { 1 };
-
-            let progress_tracker = Arc::new(LockFreeProgress::new(max_possible_combinations));
-            app.analysis_progress = Some(Arc::clone(&progress_tracker));
-
-            std::thread::spawn(move || {
-                CorrelationEntry::analyse_with_progress_chunked(&folders[0], &analysing, &progress_tracker, use_workers, 1_000_000_000);
-            });
+            app.start_analysis();
         }
 
-        let max_workers = MAX_WORKERS.load(Ordering::Relaxed);
-        ui.add(egui::Slider::new(&mut app.workers, 1..=max_workers).text("Max workers")).on_hover_ui(|ui| {
+        ui.add(egui::Slider::new(&mut app.workers, 1..=app.max_workers).text("Max workers")).on_hover_ui(|ui| {
             ui.label("Select the number of maximum workers to be used for scanning/analysing.");
         });
 
-        if !selected_folders.is_empty() {
-            let correlation_db_path = data::get_db_path::<CorrelationEntry>(&selected_folders[0]);
-            if fs::exists(&correlation_db_path).unwrap_or(false) && ui.button("Delete analysis data").clicked() {
-                match fs::remove_file(&correlation_db_path) {
-                    Ok(()) => {
-                        info!("Successfully removed analysis data");
+        let correlation_db_path = app.folders.first().map(|folder| data::get_db_path::<CorrelationEntry>(&folder.path));
+        if let Some(db_path) = correlation_db_path
+            && fs::exists(&db_path).unwrap_or(false)
+            && ui.button("Delete analysis data").clicked()
+        {
+            app.delete_analysis_db();
+        }
+    });
+}
+
+/// Renders the comparison image selection, filtering the displayed results
+/// to entries involving the selected image.
+pub fn create_comparison_file_element(app: &mut ImageDuplicatesApp, ui: &mut Ui) {
+    ui.horizontal(|ui| {
+        if ui.button("Select comparison image…").clicked()
+            && let Some(path) = rfd::FileDialog::new().add_filter("Images", &SUPPORTED_IMAGE_FILE_EXTENSION).pick_file()
+            && let Err(e) = app.select_comparison_image(&path.display().to_string())
+        {
+            error!("{e}");
+        }
+        let selected_image = shorten_string(&app.find_image_path, 50);
+        ui.label(format!("Selected image: {selected_image}"));
+        if ui.button("Clear").clicked() {
+            app.clear_comparison_image();
+        }
+    });
+}
+
+/// Renders the show/close results button and the last status message, if any.
+pub fn create_result_items(app: &mut ImageDuplicatesApp, ui: &mut Ui) {
+    let analysing = app.analysing.load(Ordering::Relaxed);
+    let scanning = app.scanning.load(Ordering::Relaxed);
+    let display_results = app.display_results;
+
+    match results_button_state(display_results, analysing, scanning) {
+        ResultsButton::CloseResults => {
+            if ui.button("Close results").clicked() {
+                app.close_results();
+            }
+        }
+        ResultsButton::ShowResults => {
+            if ui.button("Show results").clicked() {
+                app.show_results();
+            }
+        }
+        ResultsButton::None => {}
+    }
+
+    if let Some(status) = &app.status {
+        ui.label(RichText::new(status.clone()).color(Color32::RED));
+    }
+}
+
+/// Renders the result display: navigation, undo, the two images and their
+/// correlation value.
+pub fn create_result_display(app: &mut ImageDuplicatesApp, ui: &mut Ui) {
+    if !app.display_results {
+        return;
+    }
+    if app.first_path.is_empty() || app.second_path.is_empty() {
+        app.display_results = false;
+        return;
+    }
+
+    ui.horizontal(|ui| {
+        if ui.button("Previous").clicked() {
+            app.go_to_adjacent_entry(true);
+        }
+        if ui.button("Next").clicked() {
+            app.go_to_adjacent_entry(false);
+        }
+        app.auto_advance_if_missing();
+    });
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Clicking on the images moves them into the \"potential_duplicates\" folder. Clicking the button will replace the smaller one.").color(Color32::RED));
+        if !app.undo_history.is_empty()
+            && ui.button("Undo last action").clicked()
+            && let Err(e) = app.undo_last()
+        {
+            error!("{e}");
+        }
+    });
+
+    display_images(app, ui);
+
+    if let Some(corr) = app.current_correlation() {
+        ui.label(format!("Resemblance: {:.2}%", corr * 100.0));
+    }
+}
+
+/// Renders the two images side by side with the replace button between them.
+fn display_images(app: &mut ImageDuplicatesApp, ui: &mut Ui) {
+    let Some(((width1, height1), (width2, height2))) = app.current_image_dimensions() else {
+        ui.label(RichText::new("Could not read one of the images.").color(Color32::RED));
+        return;
+    };
+    let pixels1 = width1 * height1;
+    let pixels2 = width2 * height2;
+    let first_higher_res = pixels1 > pixels2;
+    let second_higher_res = pixels1 < pixels2;
+
+    // 4 lines of text, each around 12 px in height, are rendered below each
+    // image; the width gap of 25 px hosts the replace button.
+    let image_info_height = 4.0 * 12.0 * UI_SCALING_FACTOR;
+    let available_size = ui.available_size();
+    let max_image_size = (available_size.x / 2.0 - 25.0, available_size.y - image_info_height);
+
+    ui.horizontal(|ui| {
+        let clicked_first = image_component(ui, &app.first_path, Image::new(format!("file://{}", app.first_path)), max_image_size, (width1, height1), first_higher_res);
+        if clicked_first {
+            let path = app.first_path.clone();
+            if let Err(e) = app.move_to_duplicates(&path) {
+                error!("{e}");
+            }
+        }
+
+        // Check if both files have valid extensions before allowing replacement
+        let first_has_valid_ext = has_valid_image_extension(Path::new(&app.first_path));
+        let second_has_valid_ext = has_valid_image_extension(Path::new(&app.second_path));
+        let extensions_match = have_matching_extensions(Path::new(&app.first_path), Path::new(&app.second_path));
+        let can_replace = first_has_valid_ext && second_has_valid_ext && extensions_match;
+
+        match pixels1.cmp(&pixels2) {
+            Greater => {
+                if can_replace && ui.button("->").clicked() {
+                    let (source, target) = (app.first_path.clone(), app.second_path.clone());
+                    if let Err(e) = app.replace_file(&source, &target) {
+                        error!("{e}");
                     }
-                    Err(e) => error!("Could not remove analysis data: {}", e),
                 }
-                app.analysing.store(false, Ordering::Relaxed);
+            }
+            Less => {
+                if can_replace && ui.button("<-").clicked() {
+                    let (source, target) = (app.second_path.clone(), app.first_path.clone());
+                    if let Err(e) = app.replace_file(&source, &target) {
+                        error!("{e}");
+                    }
+                }
+            }
+            Equal => {
+                ui.add_space(25.0);
+            }
+        }
+
+        let clicked_second = image_component(ui, &app.second_path, Image::new(format!("file://{}", app.second_path)), max_image_size, (width2, height2), second_higher_res);
+        if clicked_second {
+            let path = app.second_path.clone();
+            if let Err(e) = app.move_to_duplicates(&path) {
+                error!("{e}");
             }
         }
     });
 }
 
-pub fn create_comparison_file_element(app: &ImageDuplicatesApp, ui: &mut Ui) {
-    ui.horizontal(|ui| {
-        if ui.button("Select comparison image…").clicked()
-            && let Some(path) = rfd::FileDialog::new().add_filter("Images", &SUPPORTED_IMAGE_FILE_EXTENSION).pick_file()
-        {
-            app.find_image_path.lock().push_str(&path.display().to_string());
-        }
-        let selected_image = shorten_string(app.find_image_path.lock().clone().as_str(), 50);
-        ui.label(format!("Selected image: {selected_image}"));
-        if ui.button("Clear").clicked() {
-            app.find_image_path.lock().clear();
-        }
-    });
+/// Renders one image with its file information. Returns whether the image
+/// was clicked.
+fn image_component(ui: &mut Ui, file_path: &str, image: Image, max_size: (f32, f32), dimensions: (u32, u32), higher_res: bool) -> bool {
+    let file_name = Path::new(file_path).file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    let parent_folder = Path::new(file_path).parent().and_then(Path::file_name).and_then(|name| name.to_str()).unwrap_or_default();
+    let scaled_image = image.fit_to_original_size(1.0).max_width(max_size.0).max_height(max_size.1).sense(Sense::click());
+
+    ui.vertical(|ui| {
+        let frame_fill = if higher_res { Color32::GREEN } else { Color32::TRANSPARENT };
+        let response = egui::Frame::default().inner_margin(2.0).fill(frame_fill).show(ui, |ui| ui.add(scaled_image));
+        ui.label(shorten_string(file_name, 37));
+        ui.label(format!("Parent folder: {}", shorten_string(parent_folder, 30)));
+        let (width, height) = dimensions;
+        ui.label(format!("Image dimensions: {width}x{height}"));
+        response.inner.clicked()
+    })
+    .inner
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::bool_assert_comparison)]
+    use {super::*, pretty_assertions::assert_eq};
+
+    #[test]
+    fn test_results_button_exclusive() {
+        // While results are open, only "Close results" may be offered,
+        // regardless of scanning/analysing state.
+        assert_eq!(ResultsButton::CloseResults, results_button_state(true, false, false));
+        assert_eq!(ResultsButton::CloseResults, results_button_state(true, true, false));
+        assert_eq!(ResultsButton::CloseResults, results_button_state(true, false, true));
+        assert_eq!(ResultsButton::CloseResults, results_button_state(true, true, true));
+
+        // While a scan or analysis is running, no button is offered.
+        assert_eq!(ResultsButton::None, results_button_state(false, true, false));
+        assert_eq!(ResultsButton::None, results_button_state(false, false, true));
+        assert_eq!(ResultsButton::None, results_button_state(false, true, true));
+
+        // Idle without results open -> "Show results".
+        assert_eq!(ResultsButton::ShowResults, results_button_state(false, false, false));
+    }
 }
