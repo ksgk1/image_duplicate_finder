@@ -1,8 +1,8 @@
 [package]
     authors = ["ksgk1"]
     edition = "2024"
-    name    = "image_duplicates"
-    version = "0.8.0"
+    name    = "image_duplicate_finder"
+    version = "0.8.1"
 
 [dependencies]
     crossbeam          = { version = "0.8.5" }

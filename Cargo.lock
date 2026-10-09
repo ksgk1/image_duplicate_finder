@@ -1729,8 +1729,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "image_duplicates"
-version = "0.8.0"
+name = "image_duplicate_finder"
+version = "0.8.1"
 dependencies = [
  "criterion",
  "crossbeam",
