@@ -37,7 +37,7 @@ use {
         fs::{File, OpenOptions},
         io::{self, BufRead, Write},
         iter::zip,
-        path::Path,
+        path::{Path, PathBuf},
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -146,11 +146,12 @@ fn to_db_path(db_folder: &str, file_path: &str) -> String {
 }
 
 /// Resolves a path stored in a database located in `db_folder` back into an
-/// absolute path. Absolute entries, as written by older versions of this
-/// tool, are returned unchanged.
+/// absolute path, normalizing the `/` separators used in the database to the
+/// platform's native ones. Absolute entries, as written by older versions of
+/// this tool, are returned unchanged.
 #[must_use]
 fn from_db_path(db_folder: &str, stored_path: &str) -> String {
-    if Path::new(stored_path).is_absolute() { stored_path.to_string() } else { Path::new(db_folder).join(stored_path).display().to_string() }
+    if Path::new(stored_path).is_absolute() { stored_path.to_string() } else { Path::new(db_folder).join(stored_path).iter().collect::<PathBuf>().display().to_string() }
 }
 
 /// Interface for the different entry types to save the entry to disk.
@@ -1446,7 +1447,10 @@ mod db_path_tests {
     fn test_from_db_path_resolves_relative_paths() {
         let folder = test_folder();
         let expected = Path::new(&folder).join("sub").join("image.png").display().to_string();
+        #[cfg(unix)]
         assert_eq!(expected, from_db_path(&folder, "sub/image.png"));
+        #[cfg(windows)]
+        assert_eq!(expected, from_db_path(&folder, "sub\\image.png"));
     }
 
     #[test]
