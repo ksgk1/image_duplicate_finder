@@ -16,11 +16,13 @@
 
 use {
     crate::{
-        constants::{ANALYSIS_CHUNK_SIZE, CORRELATION_THRESHOLD, DELETED_FOLDER, POTENTIAL_DUPLICATES_FOLDER},
-        data::{self, AppState, CorrelationEntry, DataEntry, FileMoveAction},
+        constants::{CORRELATION_THRESHOLD, DELETED_FOLDER, POTENTIAL_DUPLICATES_FOLDER, SCANNING_DATA_FILE_NAME, UI_SCALING_FACTOR},
+        data::{self, AppState, CorrelationEntry, DataEntry, FileMoveAction, get_db_path},
         progress::LockFreeProgress,
+        ui::{create_bottom_bar, create_result_display, create_setup_panel, create_top_bar, current_progress},
         util::has_valid_image_extension,
     },
+    eframe::egui::{self, ProgressBar},
     std::{
         collections::HashMap,
         fs,
@@ -30,7 +32,6 @@ use {
             Arc,
             atomic::{AtomicBool, Ordering},
         },
-        thread::available_parallelism,
         time::{Duration, Instant},
     },
     tracing::{error, info},
@@ -87,10 +88,6 @@ pub struct ImageDuplicatesApp {
     pub second_path: String,
     /// Image the results are filtered to, empty for no filter.
     pub find_image_path: String,
-    /// Worker count used for scanning and analysis.
-    pub workers: u16,
-    /// Upper bound for `workers`.
-    pub max_workers: u16,
     /// State of the primary folder, loaded lazily when a file action needs
     /// it. Reloaded automatically whenever a background operation has run
     /// since it was cached, because the databases it was loaded from have
@@ -117,7 +114,6 @@ pub struct ImageDuplicatesApp {
 
 impl Default for ImageDuplicatesApp {
     fn default() -> Self {
-        let max_workers = u16::try_from(available_parallelism().map_or(1, usize::from)).unwrap_or(1);
         Self {
             folders: Vec::new(),
             scanning: Arc::new(AtomicBool::new(false)),
@@ -130,8 +126,6 @@ impl Default for ImageDuplicatesApp {
             first_path: String::new(),
             second_path: String::new(),
             find_image_path: String::new(),
-            workers: max_workers,
-            max_workers,
             app_state: None,
             app_state_epoch: 0,
             db_epoch: 0,
@@ -168,11 +162,10 @@ impl ImageDuplicatesApp {
         let scanning = Arc::clone(&self.scanning);
         let progress_tracker = Arc::new(LockFreeProgress::new(0));
         self.scan_progress = Some(Arc::clone(&progress_tracker));
-        let worker_count = self.workers;
 
         std::thread::spawn(move || {
             // The progress total is set by the scan once the file list is known.
-            DataEntry::scan_folders_with_progress(&folders, if excludes.is_empty() { None } else { Some(&excludes) }, &scanning, &recursive, &progress_tracker, worker_count);
+            DataEntry::scan_folders_with_progress(&folders, if excludes.is_empty() { None } else { Some(&excludes) }, &scanning, &recursive, &progress_tracker);
         });
     }
 
@@ -197,13 +190,12 @@ impl ImageDuplicatesApp {
         let analysing = Arc::clone(&self.analysing);
         let progress_tracker = Arc::new(LockFreeProgress::new(0));
         self.analysis_progress = Some(Arc::clone(&progress_tracker));
-        let worker_count = self.workers;
 
         std::thread::spawn(move || {
             let data_entries = DataEntry::read_from_folder(&folder).unwrap_or_default();
             let total = if data_entries.len() > 1 { data_entries.len() * (data_entries.len() - 1) / 2 } else { 1 };
             progress_tracker.reset(total);
-            CorrelationEntry::analyse_with_progress_chunked(&folder, &analysing, &progress_tracker, worker_count, ANALYSIS_CHUNK_SIZE, Some(data_entries));
+            CorrelationEntry::analyse_with_progress(&folder, &analysing, &progress_tracker, Some(data_entries));
         });
     }
 
@@ -628,8 +620,49 @@ const fn clamp_index(idx: usize, len: usize) -> usize {
     if idx < last { idx } else { last }
 }
 
+impl eframe::App for ImageDuplicatesApp {
+    fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
+        ui.set_pixels_per_point(UI_SCALING_FACTOR);
+        self.cleanup_completed_operations();
+
+        let progress_bar = ProgressBar::new(current_progress(self)).show_percentage();
+        let can_analyse = self.folders.iter().all(|folder| Path::new(&folder.path).join(SCANNING_DATA_FILE_NAME).exists());
+        let has_analysis_data = self.folders.first().is_some_and(|folder| Path::new(&get_db_path::<CorrelationEntry>(&folder.path)).exists());
+
+        egui::Panel::top("top_bar").show(ui, |ui| {
+            create_top_bar(self, ui);
+        });
+
+        egui::Panel::left("setup_panel").default_size(300.0).min_size(240.0).show(ui, |ui| {
+            create_setup_panel(self, ui, can_analyse, has_analysis_data);
+        });
+
+        egui::Panel::bottom("bottom_bar").show(ui, |ui| {
+            create_bottom_bar(self, ui, progress_bar, can_analyse, has_analysis_data);
+        });
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            if self.display_results {
+                create_result_display(self, ui);
+            } else if self.folders.is_empty() {
+                ui.centered_and_justified(|ui| ui.strong("Select a folder in the panel on the left to begin."));
+            } else {
+                ui.centered_and_justified(|ui| ui.strong("Scan and analyse your folders, then show the results from the panel on the left."));
+            }
+        });
+
+        // Repaint continuously only while background work is running; input
+        // events trigger repaints on their own otherwise.
+        if self.scanning.load(Ordering::Relaxed) || self.analysing.load(Ordering::Relaxed) {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
     use {
         super::*,
         crate::constants::{ANALYSING_DATA_FILE_NAME, DELETED_FOLDER, POTENTIAL_DUPLICATES_FOLDER, SCANNING_DATA_FILE_NAME},
@@ -790,7 +823,7 @@ mod tests {
 
         // Phase 2: the actual selection flow.
         let mut app = ImageDuplicatesApp::default();
-        app.add_folder(folder);
+        app.add_folder(folder.clone());
         app.select_comparison_image(&comparison).expect("Selection should start the analysis");
 
         // Wait for the spawned analysis to finish.
@@ -803,6 +836,7 @@ mod tests {
         let corr = fs::read_to_string(dir.join(ANALYSING_DATA_FILE_NAME)).expect("Correlation database exists");
         assert!(corr.contains("comparison.png"), "comparison image was not correlated: {corr}");
         assert!(corr.contains("existing.png"), "existing entry was not correlated: {corr}");
+        assert!(!corr.contains(&folder), "correlation database must store paths relative to its folder: {corr}");
 
         // The per-frame cleanup refreshes the display automatically once the
         // analysis has finished, without any further clicks.

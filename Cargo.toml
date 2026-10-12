@@ -2,7 +2,7 @@
     authors = ["ksgk1"]
     edition = "2024"
     name    = "image_duplicate_finder"
-    version = "0.9.0"
+    version = "0.9.1"
 
 [dependencies]
     crossbeam          = { version = "0.8.5" }
@@ -24,6 +24,7 @@
 [lints.clippy]
     cast_precision_loss = "allow"                           # for usize to f32 conversion
     correctness         = { level = "deny", priority = -1 }
+    expect_used         = "deny"
     nursery             = { level = "deny", priority = -1 }
     pedantic            = { level = "deny", priority = -1 }
     perf                = { level = "deny", priority = -1 }

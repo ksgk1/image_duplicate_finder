@@ -1,6 +1,8 @@
+#[cfg(feature = "simd")]
+use image_duplicate_finder::data::{EntryGroup, EntryStats, GROUP_SIZE};
 use {
     criterion::{BenchmarkId, Criterion, criterion_group, criterion_main},
-    image_duplicates::data::CorrelationEntry,
+    image_duplicate_finder::data::CorrelationEntry,
     std::hint::black_box,
 };
 
@@ -38,7 +40,7 @@ fn bench_correlation_methods(c: &mut Criterion) {
 
         // Benchmark the non-SIMD implementation
         group.bench_with_input(BenchmarkId::new("non_simd", test_name), &(data_a, data_b), |b, (a, b_data)| {
-            b.iter(|| CorrelationEntry::correlation_coefficient(black_box(a), black_box(b_data)));
+            b.iter(|| CorrelationEntry::correlation_coefficient_default(black_box(a), black_box(b_data)));
         });
 
         // Benchmark the SIMD implementation (only if feature is enabled)
@@ -59,6 +61,14 @@ fn bench_correlation_methods(c: &mut Criterion) {
 fn bench_bulk_operations(c: &mut Criterion) {
     let test_data = generate_test_data();
 
+    // One full group of synthetic entries for the batched kernel.
+    #[cfg(feature = "simd")]
+    let batch_tiles: Vec<Vec<u8>> = (0..GROUP_SIZE).map(|entry| (0..16).map(|tile| u8::try_from((entry * 29 + tile * 17) % 256).unwrap_or(0)).collect()).collect();
+    #[cfg(feature = "simd")]
+    let batch_stats: Vec<EntryStats> = batch_tiles.iter().map(|tiles| EntryStats::new(tiles)).collect();
+    #[cfg(feature = "simd")]
+    let batch_group = EntryGroup::new(&batch_stats);
+
     let mut group = c.benchmark_group("bulk_correlation");
 
     // Test processing many correlation calculations (simulates real usage)
@@ -70,7 +80,7 @@ fn bench_bulk_operations(c: &mut Criterion) {
                 for i in 0..count {
                     let data_idx = i % test_data.len();
                     let (a, b_data) = &test_data[data_idx];
-                    black_box(CorrelationEntry::correlation_coefficient(black_box(a), black_box(b_data)));
+                    black_box(CorrelationEntry::correlation_coefficient_default(black_box(a), black_box(b_data)));
                 }
             });
         });
@@ -82,6 +92,17 @@ fn bench_bulk_operations(c: &mut Criterion) {
                     let data_idx = i % test_data.len();
                     let (a, b_data) = &test_data[data_idx];
                     black_box(CorrelationEntry::correlation_coefficient_simd(black_box(a), black_box(b_data)));
+                }
+            });
+        });
+
+        // The batched kernel: each call correlates one entry against all
+        // entries of a group, one per SIMD lane.
+        #[cfg(feature = "simd")]
+        group.bench_with_input(BenchmarkId::new("batch_simd", iter_count), &iter_count, |b, &count| {
+            b.iter(|| {
+                for _ in 0..count / GROUP_SIZE {
+                    black_box(CorrelationEntry::correlation_group(&batch_stats[0], &batch_group));
                 }
             });
         });

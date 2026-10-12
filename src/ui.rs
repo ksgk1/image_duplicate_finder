@@ -14,12 +14,13 @@ use {
         data::{self, CorrelationEntry},
         util::{has_valid_image_extension, have_matching_extensions, shorten_string},
     },
-    eframe::egui::{self, Color32, Image, RichText, Sense, TextStyle, Ui},
+    eframe::egui::{self, Color32, Image, ProgressBar, RichText, Sense, TextStyle, Ui},
     std::{
         cmp::Ordering::{Equal, Greater, Less},
         fs,
         path::Path,
         sync::atomic::Ordering,
+        time::Duration,
     },
     tracing::error,
 };
@@ -37,11 +38,10 @@ impl ResultsButton {
     /// Decides which results button to render: while results are open only
     /// "Close results" is offered; "Show results" is offered when the app
     /// is idle and analysis data exists; otherwise the button is disabled.
-    #[allow(clippy::fn_params_excessive_bools)] // the flags mirror the app state
-    const fn select_state(display_results: bool, analysing: bool, scanning: bool, has_analysis_data: bool) -> Self {
+    const fn select_state(display_results: bool, busy: bool, has_analysis_data: bool) -> Self {
         if display_results {
             Self::CloseResults
-        } else if !analysing && !scanning && has_analysis_data {
+        } else if !busy && has_analysis_data {
             Self::ShowResults
         } else {
             Self::None
@@ -99,7 +99,7 @@ pub fn create_bottom_bar(app: &ImageDuplicatesApp, ui: &mut Ui, progress_bar: eg
         let scanning = app.scanning.load(Ordering::Relaxed);
         let analysing = app.analysing.load(Ordering::Relaxed);
         if scanning || analysing {
-            app.create_progress_display(ui, progress_bar);
+            create_progress_display(app, ui, progress_bar);
             return;
         }
         let hint = match WorkflowHint::select_hint(!app.folders.is_empty(), can_analyse, has_analysis_data) {
@@ -212,10 +212,6 @@ fn create_scanning_controls(app: &mut ImageDuplicatesApp, ui: &mut Ui, can_analy
         }
     });
 
-    ui.add(egui::Slider::new(&mut app.workers, 1..=app.max_workers).text("Max workers")).on_hover_ui(|ui| {
-        ui.label("Select the number of maximum workers to be used for scanning/analysing.");
-    });
-
     let correlation_db_path = app.folders.first().map(|folder| data::get_db_path::<CorrelationEntry>(&folder.path));
     let db_exists = correlation_db_path.as_deref().is_some_and(|db_path| fs::exists(db_path).unwrap_or(false));
     let delete = ui
@@ -256,7 +252,7 @@ fn create_result_items(app: &mut ImageDuplicatesApp, ui: &mut Ui, has_analysis_d
     let scanning = app.scanning.load(Ordering::Relaxed);
     let display_results = app.display_results;
 
-    match ResultsButton::select_state(display_results, analysing, scanning, has_analysis_data) {
+    match ResultsButton::select_state(display_results, analysing || scanning, has_analysis_data) {
         ResultsButton::CloseResults => {
             if ui.button("Close results").clicked() {
                 app.close_results();
@@ -456,30 +452,124 @@ fn image_component(ui: &mut Ui, file_path: &str, dimensions: (u32, u32), higher_
     .inner
 }
 
+/// Current progress as a fraction between 0.0 and 1.0.
+/// Priority: scanning > analysing > idle (0.0).
+#[must_use]
+pub fn current_progress(app: &ImageDuplicatesApp) -> f32 {
+    // Check scanning first (higher priority)
+    if let Some(scan_progress) = &app.scan_progress {
+        let (processed, total, _) = scan_progress.get_progress();
+        if total > 0 {
+            return (processed as f32) / (total as f32);
+        }
+    }
+
+    // Then check analysing
+    if let Some(analysis_progress) = &app.analysis_progress {
+        let (processed, total, _) = analysis_progress.get_progress();
+        if total > 0 {
+            return (processed as f32) / (total as f32);
+        }
+    }
+    0.0
+}
+
+/// Renders the progress bar with the operation status and the estimated time
+/// remaining next to it. Only called while a scan or analysis is running.
+fn create_progress_display(app: &ImageDuplicatesApp, ui: &mut Ui, progress_bar: ProgressBar) {
+    ui.horizontal(|ui| {
+        ui.add(progress_bar.desired_width(240.0));
+
+        let status = operation_status(app);
+        if !status.is_empty() {
+            ui.label(status);
+        }
+
+        let remaining = estimated_time_remaining(app);
+        if !remaining.is_empty() {
+            ui.label(remaining);
+        }
+    });
+}
+
+/// Current operation status as a formatted line, empty while idle.
+fn operation_status(app: &ImageDuplicatesApp) -> String {
+    // Check scanning first (higher priority)
+    if let Some(progress) = &app.scan_progress {
+        let (processed, total, _) = progress.get_progress();
+        return format_operation_status("Scanning", processed, total, "files");
+    }
+
+    // Then check analysing
+    if let Some(progress) = &app.analysis_progress {
+        let (processed, total, _) = progress.get_progress();
+        return format_operation_status("Analyzing", processed, total, "combinations");
+    }
+
+    String::new()
+}
+
+/// Formats an operation status line with a percentage.
+fn format_operation_status(operation: &str, processed: usize, total: usize, unit: &str) -> String {
+    if total > 0 {
+        let percentage = (processed as f64 / total as f64) * 100.0;
+        format!("{operation}: {processed}/{total} {unit} ({percentage:.1}%)")
+    } else {
+        format!("{operation}: {processed} {unit}")
+    }
+}
+
+/// Estimated time remaining as a formatted line, empty while idle.
+fn estimated_time_remaining(app: &ImageDuplicatesApp) -> String {
+    // Check scanning first (higher priority)
+    let Some(progress) = app.scan_progress.as_ref().or(app.analysis_progress.as_ref()) else {
+        return String::new();
+    };
+    match progress.estimated_remaining() {
+        Some(remaining) if !remaining.is_zero() => format_time_remaining(remaining),
+        Some(_) => "Complete!".to_string(),
+        None => "Calculating time remaining...".to_string(),
+    }
+}
+
+/// Formats a duration in a human-readable way.
+fn format_time_remaining(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+
+    if total_seconds < 60 {
+        format!("Estimated: {total_seconds} seconds remaining")
+    } else if total_seconds < 3600 {
+        let minutes = total_seconds / 60;
+        let seconds = total_seconds % 60;
+        format!("Estimated: {minutes}m {seconds}s remaining")
+    } else {
+        let hours = total_seconds / 3600;
+        let minutes = (total_seconds % 3600) / 60;
+        let seconds = total_seconds % 60;
+        format!("Estimated: {hours}h {minutes}m {seconds}s remaining")
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::bool_assert_comparison)]
     use {super::*, pretty_assertions::assert_eq};
 
     #[test]
     fn test_results_button_exclusive() {
         // While results are open, only "Close results" may be offered,
-        // regardless of scanning/analysing state or available data.
-        assert_eq!(ResultsButton::CloseResults, ResultsButton::select_state(true, false, false, false));
-        assert_eq!(ResultsButton::CloseResults, ResultsButton::select_state(true, true, false, true));
-        assert_eq!(ResultsButton::CloseResults, ResultsButton::select_state(true, false, true, false));
-        assert_eq!(ResultsButton::CloseResults, ResultsButton::select_state(true, true, true, true));
+        // regardless of busy state or available data.
+        assert_eq!(ResultsButton::CloseResults, ResultsButton::select_state(true, false, false));
+        assert_eq!(ResultsButton::CloseResults, ResultsButton::select_state(true, true, true));
 
         // While a scan or analysis is running, no button is offered.
-        assert_eq!(ResultsButton::None, ResultsButton::select_state(false, true, false, true));
-        assert_eq!(ResultsButton::None, ResultsButton::select_state(false, false, true, false));
-        assert_eq!(ResultsButton::None, ResultsButton::select_state(false, true, true, true));
+        assert_eq!(ResultsButton::None, ResultsButton::select_state(false, true, true));
+        assert_eq!(ResultsButton::None, ResultsButton::select_state(false, true, false));
 
         // Idle without analysis data -> disabled, there is nothing to show.
-        assert_eq!(ResultsButton::None, ResultsButton::select_state(false, false, false, false));
+        assert_eq!(ResultsButton::None, ResultsButton::select_state(false, false, false));
 
         // Idle with analysis data -> "Show results".
-        assert_eq!(ResultsButton::ShowResults, ResultsButton::select_state(false, false, false, true));
+        assert_eq!(ResultsButton::ShowResults, ResultsButton::select_state(false, false, true));
     }
 
     #[test]

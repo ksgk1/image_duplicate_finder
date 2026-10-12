@@ -27,7 +27,13 @@ pub fn visit_dirs(folder_path: &Path, recursive: bool, exclude: Option<&[String]
         match fs::read_dir(folder_path) {
             Ok(iter) => {
                 for entry in iter {
-                    let entry = entry.expect("Entry is valid.");
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(e) => {
+                            error!("Error reading directory entry in {folder_path:?}: {e}");
+                            continue;
+                        }
+                    };
                     let path = entry.path();
                     if path.is_dir() && recursive {
                         visit_dirs(&path, recursive, exclude, callback);

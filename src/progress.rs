@@ -51,7 +51,7 @@ impl LockFreeProgress {
     }
 
     /// Calculate estimated time remaining based on current progress
-    /// Returns `None` if progress is 0% or if calculation would overflow
+    /// Returns `None` if progress is 0% or if the calculation overflows
     /// Returns `Some(Duration::ZERO)` when complete (100%)
     pub fn estimated_remaining(&self) -> Option<std::time::Duration> {
         let (processed, total, _) = self.get_progress();
@@ -64,20 +64,12 @@ impl LockFreeProgress {
             return Some(std::time::Duration::ZERO);
         }
 
-        let elapsed = self.elapsed();
-
-        // Use f64 for more precise division to avoid integer division truncation
-        let avg_time_per_item_ns = elapsed.as_nanos() as f64 / processed as f64;
-        let remaining_items = total - processed;
-        let remaining_ns = avg_time_per_item_ns * remaining_items as f64;
-
-        // Convert back to Duration, ensuring we don't overflow
-        if remaining_ns > 0.0 && remaining_ns < u64::MAX as f64 {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            Some(std::time::Duration::from_nanos(remaining_ns as u64))
-        } else {
-            None
-        }
+        let elapsed_ns = u64::try_from(self.elapsed().as_nanos()).ok()?;
+        let processed = u64::try_from(processed).ok()?;
+        let remaining_items = u64::try_from(total).ok()?.checked_sub(processed)?;
+        let nanos_per_item = elapsed_ns / processed;
+        let remaining_ns = nanos_per_item.checked_mul(remaining_items)?;
+        Some(std::time::Duration::from_nanos(remaining_ns))
     }
 
     /// Reset the progress tracker with a new total
@@ -86,26 +78,5 @@ impl LockFreeProgress {
         self.total.store(new_total, Ordering::Relaxed);
         // Reset start time for accurate timing
         // Note: This doesn't actually reset start_time, but we could add that if needed
-    }
-
-    /// Get current progress as a percentage (0.0 to 1.0)
-    #[allow(dead_code)]
-    pub fn get_progress_percentage(&self) -> f64 {
-        let (_, _, progress) = self.get_progress();
-        progress
-    }
-
-    /// Check if the operation is complete
-    #[allow(dead_code)]
-    pub fn is_complete(&self) -> bool {
-        let (processed, total, _) = self.get_progress();
-        processed >= total
-    }
-
-    /// Get remaining items count
-    #[allow(dead_code)]
-    pub fn remaining(&self) -> usize {
-        let (processed, total, _) = self.get_progress();
-        total.saturating_sub(processed)
     }
 }
